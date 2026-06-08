@@ -172,7 +172,7 @@ app.use(helmet({
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
       fontSrc: ["'self'", "https://fonts.gstatic.com"],
       imgSrc: ["'self'", "data:", "https://*"],
-      connectSrc: ["'self'", "http://localhost:5000", "ws://localhost:5173", "http://127.0.0.1:5000", "http://localhost:5000/metrics"],
+      connectSrc: ["'self'", "http://localhost:5000", "ws://localhost:5173", "http://127.0.0.1:5000", "http://localhost:5000/metrics", "https://emi-backend-platform.vercel.app", "https://emi-frontend-platform.vercel.app"],
     },
   },
 }));
@@ -190,8 +190,18 @@ app.get('/metrics', async (req, res) => {
 app.use('/api', apiThrottler);
 
 // Middlewares
+const allowedOrigins = [
+  'http://localhost:5173',
+  'https://emi-frontend-platform.vercel.app'
+];
 app.use(cors({
-  origin: 'http://localhost:5173', // Vite React dev server port
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
 }));
 app.use(express.json());
