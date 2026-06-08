@@ -1,0 +1,163 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Mitr AI Financial Operating System API Documentation",
+    "description": "Comprehensive specification for the backend advisory, loan amortization, analytics, and security services.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:5000/api",
+      "description": "Local Development Server"
+    }
+  ],
+  "paths": {
+    "/auth/signup": {
+      "post": {
+        "summary": "Register a new user profile",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name", "email", "password"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "email": { "type": "string" },
+                  "password": { "type": "string" },
+                  "income": { "type": "number", "default": 0 },
+                  "expenses": { "type": "number", "default": 0 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "User created successfully" },
+          "400": { "description": "Invalid payload or user exists" }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "summary": "Authenticate user and set cookie session",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "password"],
+                "properties": {
+                  "email": { "type": "string" },
+                  "password": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Login successful" },
+          "401": { "description": "Invalid credentials" }
+        }
+      }
+    },
+    "/auth/profile": {
+      "get": {
+        "summary": "Retrieve active logged-in user profile details",
+        "security": [{ "cookieAuth": [] }],
+        "responses": {
+          "200": { "description": "Profile data returned" }
+        }
+      },
+      "delete": {
+        "summary": "GDPR erasure: delete account and purge all linked records",
+        "security": [{ "cookieAuth": [] }],
+        "responses": {
+          "200": { "description": "Account and all tracking records deleted" }
+        }
+      }
+    },
+    "/auth/profile/export": {
+      "get": {
+        "summary": "GDPR portability: export user's full data record as JSON",
+        "security": [{ "cookieAuth": [] }],
+        "responses": {
+          "200": { "description": "JSON download payload" }
+        }
+      }
+    },
+    "/loans": {
+      "get": {
+        "summary": "Retrieve user loans",
+        "security": [{ "cookieAuth": [] }],
+        "responses": {
+          "200": { "description": "List of active loan contracts" }
+        }
+      },
+      "post": {
+        "summary": "Create a tracked loan commitment",
+        "security": [{ "cookieAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["provider", "loanType", "principal", "interestRate", "tenure"],
+                "properties": {
+                  "provider": { "type": "string" },
+                  "loanType": { "type": "string" },
+                  "principal": { "type": "number" },
+                  "interestRate": { "type": "number" },
+                  "tenure": { "type": "number" },
+                  "emiAmount": { "type": "number" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Loan tracking started" }
+        }
+      }
+    },
+    "/analytics/forecast": {
+      "get": {
+        "summary": "Retrieve net worth, debt payoff, and cash flow projections",
+        "security": [{ "cookieAuth": [] }],
+        "responses": {
+          "200": { "description": "12-month projections dataset" }
+        }
+      }
+    },
+    "/intelligence/credit-prediction": {
+      "get": {
+        "summary": "Calculate active credit rating and simulate score paths",
+        "security": [{ "cookieAuth": [] }],
+        "responses": {
+          "200": { "description": "FICO rating and scenarios predictions" }
+        }
+      }
+    },
+    "/intelligence/wealth-advice": {
+      "get": {
+        "summary": "Calculate wealth rebalancing, emergency targets, and payoff optimizer",
+        "security": [{ "cookieAuth": [] }],
+        "responses": {
+          "200": { "description": "Asset rebalancing allocation suggestion" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "cookieAuth": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "token"
+      }
+    }
+  }
+}
