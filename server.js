@@ -148,6 +148,22 @@ import { createFeedback, getFeedback, createCrashReport, createAnalyticsEvent } 
 dotenv.config();
 
 // Startup Environment Validation Checks
+console.log('--- Environment Variables Status ---');
+console.log(`MONGO_URI set: ${!!process.env.MONGO_URI}`);
+console.log(`JWT_SECRET set: ${!!process.env.JWT_SECRET}`);
+console.log(`GEMINI_API_KEY set: ${!!process.env.GEMINI_API_KEY}`);
+if (process.env.MONGO_URI) {
+  try {
+    const parsedUrl = process.env.MONGO_URI.startsWith('mongodb+srv://') 
+      ? new URL(process.env.MONGO_URI.replace('mongodb+srv://', 'http://'))
+      : new URL(process.env.MONGO_URI);
+    console.log(`MONGO_URI Host: ${parsedUrl.host}, Path: ${parsedUrl.pathname}`);
+  } catch (e) {
+    console.log(`MONGO_URI (masked): ${process.env.MONGO_URI.substring(0, 20)}...`);
+  }
+}
+console.log('------------------------------------');
+
 const requiredEnv = ['MONGO_URI', 'JWT_SECRET', 'GEMINI_API_KEY'];
 const missingEnv = requiredEnv.filter(key => !process.env[key] || process.env[key] === 'PLACEHOLDER');
 if (missingEnv.length > 0) {
@@ -156,7 +172,9 @@ if (missingEnv.length > 0) {
 }
 
 // Connect to Database
-connectDB();
+connectDB().catch(err => {
+  console.error('⚠️ Database connection failed at startup. Server will run but DB features will fail:', err.message);
+});
 
 // Initialize Daily Cron Scheduler (Notification Outbox Worker)
 initScheduler();
