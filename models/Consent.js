@@ -11,6 +11,10 @@ const consentSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    bankId: {
+      type: String,
+      required: false,
+    },
     consentId: {
       type: String,
       required: true,

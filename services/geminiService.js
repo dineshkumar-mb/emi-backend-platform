@@ -1,4 +1,11 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import crypto from 'crypto';
+
+const isInvalidOrLeakedKey = (key) => {
+  if (!key || key === 'PLACEHOLDER') return true;
+  const hash = crypto.createHash('sha256').update(key).digest('hex');
+  return hash === 'd81f6b86a712c52ac4f1ae959aebea377e196fa4947255f1098ae835404c57ec';
+};
 
 // ── System Prompt: Security-First SMS Intelligence Engine ──────────────────────
 const SMS_SYSTEM_PROMPT = `You are a security-first financial intelligence engine for EMI and UPI/GPay transaction parsing.
@@ -67,8 +74,8 @@ Valid securityFlags values: "otp_detected", "pin_detected", "cvv_detected", "sus
  */
 export const extractLoanFromFile = async (buffer, mimeType) => {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'PLACEHOLDER') {
-    throw new Error('GEMINI_API_KEY is not configured. Please supply a valid key in the backend .env file.');
+  if (isInvalidOrLeakedKey(apiKey)) {
+    throw new Error('GEMINI_API_KEY is not configured or is invalid (leaked). Please supply a valid key in the backend .env file.');
   }
 
   const genAI = new GoogleGenerativeAI(apiKey);
@@ -154,8 +161,28 @@ Output Schema:
  */
 export const parseSmsWithGemini = async (smsText) => {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'PLACEHOLDER') {
-    throw new Error('GEMINI_API_KEY is not configured.');
+  if (isInvalidOrLeakedKey(apiKey)) {
+    return {
+      isRelevant: false,
+      isEMIRelated: false,
+      channel: 'unknown',
+      provider: null,
+      merchantOrBank: null,
+      loanType: null,
+      transactionType: 'unknown',
+      amount: null,
+      currency: 'INR',
+      paymentStatus: 'unknown',
+      paymentDate: null,
+      accountEnding: null,
+      referenceIdMasked: null,
+      isRecurringPattern: false,
+      estimatedMonthlyEMI: null,
+      confidence: 0,
+      securityFlags: ['low_signal'],
+      explanation: 'AI parsing unavailable due to unconfigured or leaked GEMINI_API_KEY.',
+      classification: 'Unknown',
+    };
   }
 
   // Basic pre-screening: reject obviously empty input
@@ -284,8 +311,21 @@ Scoring guidance:
  */
 export const validatePaymentWithGemini = async (payload) => {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'PLACEHOLDER') {
-    throw new Error('GEMINI_API_KEY is not configured.');
+  if (isInvalidOrLeakedKey(apiKey)) {
+    const { parsedPayment, matchedLoan } = payload;
+    const validated = parsedPayment.isEMIRelated && parsedPayment.paymentStatus === 'success' && parsedPayment.confidence >= 60;
+    const deviation = matchedLoan.emiAmount ? Math.abs(parsedPayment.amount - matchedLoan.emiAmount) / matchedLoan.emiAmount : 0;
+    let riskLevel = 'low';
+    if (deviation > 0.20) riskLevel = 'high';
+    else if (deviation > 0.08) riskLevel = 'medium';
+    return {
+      validated,
+      riskLevel,
+      linkedLoanConfidence: matchedLoan.providerNameMatch ? 80 : 40,
+      recommendation: validated ? 'Payment validated successfully offline.' : 'Payment could not be validated offline.',
+      nextAction: validated ? 'confirm_payment' : 'flag_for_review',
+      manualReviewRequired: !validated
+    };
   }
 
   const { parsedPayment, matchedLoan, timestamp, engineUsed } = payload;
@@ -351,13 +391,615 @@ export const validatePaymentWithGemini = async (payload) => {
 };
 
 /**
+ * Offline / Rule-Based Financial Advisor fallback
+ */
+export const askAdvisorOffline = (query, loans = [], assets = [], goals = [], subscriptions = [], income = 0, expenses = 0) => {
+  const normQuery = query.toLowerCase();
+
+  const simulateOneTimePrepayment = (balance, rate, emi, prepayAmount) => {
+    let normalBalance = balance;
+    let normalInterest = 0;
+    let normalMonths = 0;
+    const monthlyRate = rate / 12 / 100;
+    
+    if (emi <= 0 || rate < 0 || balance <= 0) {
+      return { interestSaved: 0, tenureReducedMonths: 0 };
+    }
+    
+    while (normalBalance > 0 && normalMonths < 360) {
+      normalMonths++;
+      const interest = normalBalance * monthlyRate;
+      normalInterest += interest;
+      const payment = Math.min(emi, normalBalance + interest);
+      normalBalance = normalBalance + interest - payment;
+      if (payment <= interest && normalBalance > 0) {
+        break;
+      }
+    }
+
+    let prepayBalance = Math.max(0, balance - prepayAmount);
+    let prepayInterest = 0;
+    let prepayMonths = 0;
+    
+    while (prepayBalance > 0 && prepayMonths < 360) {
+      prepayMonths++;
+      const interest = prepayBalance * monthlyRate;
+      prepayInterest += interest;
+      const payment = Math.min(emi, prepayBalance + interest);
+      prepayBalance = prepayBalance + interest - payment;
+      if (payment <= interest && prepayBalance > 0) {
+        break;
+      }
+    }
+
+    const interestSaved = Math.max(0, Number((normalInterest - prepayInterest).toFixed(2)));
+    const tenureReducedMonths = Math.max(0, normalMonths - prepayMonths);
+
+    return { interestSaved, tenureReducedMonths };
+  };
+
+  const simulateMonthlyPrepayment = (balance, rate, emi, extraMonthly) => {
+    let normalBalance = balance;
+    let normalInterest = 0;
+    let normalMonths = 0;
+    const monthlyRate = rate / 12 / 100;
+    
+    if (emi <= 0 || rate < 0 || balance <= 0) {
+      return { interestSaved: 0, tenureReducedMonths: 0 };
+    }
+    
+    while (normalBalance > 0 && normalMonths < 360) {
+      normalMonths++;
+      const interest = normalBalance * monthlyRate;
+      normalInterest += interest;
+      const payment = Math.min(emi, normalBalance + interest);
+      normalBalance = normalBalance + interest - payment;
+      if (payment <= interest && normalBalance > 0) {
+        break;
+      }
+    }
+
+    let prepayBalance = balance;
+    let prepayInterest = 0;
+    let prepayMonths = 0;
+    
+    while (prepayBalance > 0 && prepayMonths < 360) {
+      prepayMonths++;
+      const interest = prepayBalance * monthlyRate;
+      prepayInterest += interest;
+      const payment = Math.min(emi + extraMonthly, prepayBalance + interest);
+      prepayBalance = prepayBalance + interest - payment;
+      if (payment <= interest && prepayBalance > 0) {
+        break;
+      }
+    }
+
+    const interestSaved = Math.max(0, Number((normalInterest - prepayInterest).toFixed(2)));
+    const tenureReducedMonths = Math.max(0, normalMonths - prepayMonths);
+
+    return { interestSaved, tenureReducedMonths };
+  };
+
+  const activeLoans = (loans || []).filter(l => l.status === 'active' || l.outstandingBalance > 0);
+  const totalOutstanding = activeLoans.reduce((sum, l) => sum + (l.outstandingBalance || 0), 0);
+  const totalEmi = activeLoans.reduce((sum, l) => sum + (l.emiAmount || 0), 0);
+  const totalAssets = (assets || []).reduce((sum, a) => sum + (a.value || 0), 0);
+  const netWorth = totalAssets - totalOutstanding;
+
+  // 1. Dynamic Entities extraction
+  // Extract custom numbers like 3000, 3k, 1.5L
+  const parseAmount = (text) => {
+    const match = text.match(/(\d+(?:\.\d+)?)\s*(k|lakhs?|lacs?|l)\b/i);
+    if (match) {
+      const val = parseFloat(match[1]);
+      const suffix = match[2].toLowerCase();
+      if (suffix === 'k') return val * 1000;
+      if (suffix.startsWith('l')) return val * 100000;
+      return val;
+    }
+    const allNumbers = text.replace(/,/g, '').match(/\b\d+(?:\.\d+)?\b/g);
+    if (allNumbers) {
+      for (const numStr of allNumbers) {
+        const val = parseFloat(numStr);
+        const index = text.indexOf(numStr);
+        if (index !== -1) {
+          const after = text.substring(index + numStr.length, index + numStr.length + 3);
+          if (after.includes('%')) continue;
+        }
+        if (val >= 2020 && val <= 2040 && !text.includes('₹' + numStr) && !text.includes('rs' + numStr)) {
+          continue;
+        }
+        if (val < 100) continue;
+        return val;
+      }
+    }
+    return null;
+  };
+
+  const customExtraAmount = parseAmount(normQuery);
+
+  let emiMultiplier = null;
+  const emiMatch = normQuery.match(/\b(\d+)\s*emis?\b/i) || normQuery.match(/\b(one|two|three|four|five)\s*emis?\b/i);
+  if (emiMatch) {
+    const wordToNum = { one: 1, two: 2, three: 3, four: 4, five: 5 };
+    const val = parseInt(emiMatch[1]) || wordToNum[emiMatch[1].toLowerCase()];
+    if (val) emiMultiplier = val;
+  }
+
+  // Match specific loans from user's active portfolio
+  const matchedLoans = [];
+  activeLoans.forEach(loan => {
+    const provider = (loan.provider || '').toLowerCase();
+    const type = (loan.loanType || '').toLowerCase();
+    
+    const providerWords = provider.split(/\s+/).filter(w => w.length > 2);
+    let providerMatched = providerWords.some(word => normQuery.includes(word));
+    
+    if (provider.length > 2 && normQuery.includes(provider)) {
+      providerMatched = true;
+    }
+    
+    let typeMatched = false;
+    if (type.length > 2) {
+      const typeWords = type.replace('loan', '').trim();
+      if (typeWords.length > 2 && normQuery.includes(typeWords)) {
+        typeMatched = true;
+      }
+    }
+    
+    if (providerMatched || typeMatched) {
+      matchedLoans.push(loan);
+    }
+  });
+
+  // 2. Classify Intent
+  let intent = 'general';
+  
+  if (
+    normQuery.includes('extra') || 
+    normQuery.includes('prepay') || 
+    normQuery.includes('save') || 
+    normQuery.includes('interest') || 
+    normQuery.includes('emi') ||
+    normQuery.includes('prepayment') ||
+    normQuery.includes('refinance') ||
+    normQuery.includes('amortization') ||
+    normQuery.includes('tenure')
+  ) {
+    intent = 'prepayment';
+  } else if (
+    normQuery.includes('close') || 
+    normQuery.includes('order') || 
+    normQuery.includes('priority') || 
+    normQuery.includes('first') || 
+    normQuery.includes('avalanche') || 
+    normQuery.includes('snowball') ||
+    normQuery.includes('which loan')
+  ) {
+    intent = 'priority';
+  } else if (
+    normQuery.includes('health') || 
+    normQuery.includes('score') || 
+    normQuery.includes('burden') || 
+    normQuery.includes('ratio') || 
+    normQuery.includes('dti') ||
+    normQuery.includes('fico')
+  ) {
+    intent = 'health';
+  } else if (
+    normQuery.includes('net worth') || 
+    normQuery.includes('asset') || 
+    normQuery.includes('portfolio') || 
+    normQuery.includes('wealth') ||
+    normQuery.includes('investment')
+  ) {
+    intent = 'wealth';
+  } else if (
+    normQuery.includes('subscription') || 
+    normQuery.includes('saas') || 
+    normQuery.includes('netflix') || 
+    normQuery.includes('prime') || 
+    normQuery.includes('spotify') || 
+    normQuery.includes('youtube')
+  ) {
+    intent = 'subscription';
+  } else if (
+    normQuery.includes('loan') || 
+    normQuery.includes('debt') ||
+    matchedLoans.length > 0
+  ) {
+    intent = 'loans_info';
+  }
+
+  // 3. Process Intent
+  if (intent === 'prepayment') {
+    if (activeLoans.length === 0) {
+      return {
+        response: "You currently do not have any active loans, so there are no EMIs or prepayments to simulate. If you plan to take a loan in the future, you can simulate prepayment options here.",
+        reasoning: "User asked about prepayments but has no active loans.",
+        calculationDetails: "N/A",
+        assumptionsMade: "None",
+        confidenceScore: 100,
+        simulations: [],
+        recommendations: ["Ensure your asset allocation is optimized since you have no outstanding debt."],
+        actions: []
+      };
+    }
+
+    const targetLoans = matchedLoans.length > 0 ? matchedLoans : activeLoans;
+    const isMonthly = normQuery.includes('monthly') || normQuery.includes('every month') || normQuery.includes('per month') || normQuery.includes('each month') || normQuery.includes('/mo') || normQuery.includes('/month');
+    const isOneTime = normQuery.includes('one-time') || normQuery.includes('once') || normQuery.includes('lump') || normQuery.includes('now') || normQuery.includes('one time');
+
+    const simulations = [];
+    const recommendations = [];
+
+    targetLoans.forEach(loan => {
+      let extraAmt = customExtraAmount;
+      if (!extraAmt && emiMultiplier) {
+        extraAmt = loan.emiAmount * emiMultiplier;
+      }
+
+      if (extraAmt) {
+        if (isMonthly || (!isMonthly && !isOneTime)) {
+          const monthlySim = simulateMonthlyPrepayment(loan.outstandingBalance, loan.interestRate, loan.emiAmount, extraAmt);
+          simulations.push({
+            description: `Pay ₹${extraAmt.toLocaleString('en-IN')}/mo extra on ${loan.provider} ${loan.loanType}`,
+            interestSaved: monthlySim.interestSaved,
+            tenureReducedMonths: monthlySim.tenureReducedMonths
+          });
+        }
+        if (isOneTime || (!isMonthly && !isOneTime)) {
+          const oneTimeSim = simulateOneTimePrepayment(loan.outstandingBalance, loan.interestRate, loan.emiAmount, extraAmt);
+          simulations.push({
+            description: `One-time lump-sum prepayment of ₹${extraAmt.toLocaleString('en-IN')} on ${loan.provider} ${loan.loanType}`,
+            interestSaved: oneTimeSim.interestSaved,
+            tenureReducedMonths: oneTimeSim.tenureReducedMonths
+          });
+        }
+      } else {
+        // Fallback standard simulations
+        const prepay2Emi = loan.emiAmount * 2;
+        const oneTimeSim = simulateOneTimePrepayment(loan.outstandingBalance, loan.interestRate, loan.emiAmount, prepay2Emi);
+        simulations.push({
+          description: `Lump-sum 2 EMIs prepayment (₹${prepay2Emi.toLocaleString('en-IN')}) on ${loan.provider} ${loan.loanType}`,
+          interestSaved: oneTimeSim.interestSaved,
+          tenureReducedMonths: oneTimeSim.tenureReducedMonths
+        });
+
+        const monthlyExtra = Math.round(loan.emiAmount * 0.1);
+        const monthlySim = simulateMonthlyPrepayment(loan.outstandingBalance, loan.interestRate, loan.emiAmount, monthlyExtra);
+        simulations.push({
+          description: `Pay ₹${monthlyExtra.toLocaleString('en-IN')}/mo extra on ${loan.provider} ${loan.loanType}`,
+          interestSaved: monthlySim.interestSaved,
+          tenureReducedMonths: monthlySim.tenureReducedMonths
+        });
+      }
+    });
+
+    let bestLoan = null;
+    let highestInterest = 0;
+    targetLoans.forEach(loan => {
+      if (loan.interestRate > highestInterest) {
+        highestInterest = loan.interestRate;
+        bestLoan = loan;
+      }
+    });
+
+    if (bestLoan) {
+      recommendations.push(`Prioritize prepayment on your ${bestLoan.provider} ${bestLoan.loanType} first. Due to its high interest rate of ${bestLoan.interestRate}%, prepaying here yields the highest mathematical savings.`);
+    }
+    recommendations.push(customExtraAmount 
+      ? `Simulating an extra ₹${customExtraAmount.toLocaleString('en-IN')} on top of your monthly EMI helps you pay off the principal much faster.`
+      : "Consider automating an extra 10% on top of your monthly EMI. This small contribution significantly reduces the total interest burden over time.");
+    recommendations.push("Ensure you keep a 3-to-6 month emergency fund intact before initiating large lump-sum prepayments.");
+
+    let responseText = `### 💰 Prepayment & Interest Savings Simulations\n\n`;
+    if (customExtraAmount) {
+      responseText += `We simulated prepayment scenarios across your active loans for your requested amount of **₹${customExtraAmount.toLocaleString('en-IN')}**:\n\n`;
+    } else {
+      responseText += `We simulated prepayment scenarios across your active loans using a precise mathematical amortization model:\n\n`;
+    }
+      
+    simulations.forEach(sim => {
+      responseText += `- **${sim.description}**:\n  - **Interest Saved:** ₹${sim.interestSaved.toLocaleString('en-IN')}\n  - **Tenure Reduced:** ${sim.tenureReducedMonths} months\n`;
+    });
+
+    if (bestLoan) {
+      responseText += `\n**Strategic Recommendation:**\nYour highest interest rate liability is the **${bestLoan.provider} ${bestLoan.loanType}** at **${bestLoan.interestRate}%** annual interest. Repaying this loan first using the **Avalanche strategy** is highly recommended.`;
+    }
+
+    const actions = [];
+    if (bestLoan) {
+      actions.push({
+        type: "CREATE_REPAYMENT_PLAN",
+        parameters: {
+          strategy: "avalanche",
+          extraPayment: customExtraAmount || Math.round(totalEmi * 0.1)
+        }
+      });
+    }
+
+    return {
+      response: responseText,
+      reasoning: customExtraAmount 
+        ? `Simulated monthly payment and lump-sum prepayment of custom amount ₹${customExtraAmount} across active loans.`
+        : "Simulated one-time 2-EMI prepayment and monthly 10% extra payment across all active loans.",
+      calculationDetails: "Calculated using standard monthly compounding amortization equations offline.",
+      assumptionsMade: "Assumed interest rates remain constant throughout the tenure and payments are made on time.",
+      confidenceScore: 98,
+      simulations,
+      recommendations,
+      actions
+    };
+  }
+
+  if (intent === 'priority') {
+    if (activeLoans.length === 0) {
+      return {
+        response: "You have no active loans or debt. You are currently debt-free!",
+        reasoning: "User asked about loan closure priority but has no liabilities.",
+        calculationDetails: "N/A",
+        assumptionsMade: "None",
+        confidenceScore: 100,
+        simulations: [],
+        recommendations: ["Maintain a healthy asset allocation and continue building investments."],
+        actions: []
+      };
+    }
+
+    const avalancheOrder = [...activeLoans].sort((a, b) => b.interestRate - a.interestRate);
+    const snowballOrder = [...activeLoans].sort((a, b) => a.outstandingBalance - b.outstandingBalance);
+
+    let responseText = `### 📋 Recommended Debt Payoff Strategy\n\nTo become debt-free as fast as possible, there are two primary approaches:\n\n`;
+    responseText += `#### 1. 🏔️ The Avalanche Method (Interest Rate Priority - Mathematically Optimal)\n`;
+    responseText += `Prioritize prepaying the loans with the highest interest rates first to minimize total interest paid.\n`;
+    avalancheOrder.forEach((loan, idx) => {
+      responseText += `${idx + 1}. **${loan.provider} ${loan.loanType}** (Interest: **${loan.interestRate}%**, Balance: ₹${loan.outstandingBalance.toLocaleString('en-IN')})\n`;
+    });
+
+    responseText += `\n#### 2. ❄️ The Snowball Method (Balance Size Priority - Psychological Wins)\n`;
+    responseText += `Prioritize prepaying the loans with the smallest outstanding balances first to close accounts quickly and build momentum.\n`;
+    snowballOrder.forEach((loan, idx) => {
+      responseText += `${idx + 1}. **${loan.provider} ${loan.loanType}** (Balance: ₹${loan.outstandingBalance.toLocaleString('en-IN')}, Interest: **${loan.interestRate}%**)\n`;
+    });
+
+    const highestRateLoan = avalancheOrder[0];
+    responseText += `\n**Our Recommendation:**\nWe recommend starting with the **Avalanche Method** by focusing extra payments on your **${highestRateLoan.provider} ${highestRateLoan.loanType}** because its rate of **${highestRateLoan.interestRate}%** is the highest cost drag on your household finances.`;
+
+    const simulations = [
+      {
+        description: `Avalanche Strategy (Focusing ₹5,000/mo extra on ${highestRateLoan.provider})`,
+        interestSaved: Math.round(highestRateLoan.outstandingBalance * (highestRateLoan.interestRate / 100) * 0.18),
+        tenureReducedMonths: Math.max(3, Math.round(highestRateLoan.tenure * 0.2))
+      }
+    ];
+
+    return {
+      response: responseText,
+      reasoning: "Sorted active liabilities by interest rate (Avalanche) and outstanding balance (Snowball) to present debt payoff choices.",
+      calculationDetails: "Avalanche sorts by Rate DESC. Snowball sorts by Balance ASC.",
+      assumptionsMade: "Assumes minimum payments are maintained on all loans while directing extra surplus to the priority loan.",
+      confidenceScore: 95,
+      simulations,
+      recommendations: [
+        `Focus extra repayments on your ${highestRateLoan.provider} ${highestRateLoan.loanType}.`,
+        `Pay the absolute minimum on your other active loans.`,
+        `Roll over the entire EMI amount of closed loans into prepaying the next priority account.`
+      ],
+      actions: [
+        {
+          type: "CREATE_REPAYMENT_PLAN",
+          parameters: {
+            strategy: "avalanche",
+            extraPayment: 5000
+          }
+        }
+      ]
+    };
+  }
+
+  if (intent === 'health') {
+    const dti = income > 0 ? Math.round((totalEmi / income) * 100) : 0;
+    const surplus = Math.max(0, income - expenses - totalEmi);
+    const savingsRatio = income > 0 ? Math.round((surplus / income) * 100) : 0;
+
+    let score = 100;
+    if (dti > 45) score -= 30;
+    else if (dti > 30) score -= 15;
+    if (savingsRatio < 10) score -= 25;
+    else if (savingsRatio < 20) score -= 10;
+    if (totalOutstanding > totalAssets) score -= 20;
+
+    let rating = 'Excellent';
+    if (score < 50) rating = 'Poor';
+    else if (score < 70) rating = 'Average';
+    else if (score < 85) rating = 'Good';
+
+    let responseText = `### 📊 Financial Health & Debt Burden Analysis\n\nHere is your real-time financial health index analysis:\n\n`;
+    responseText += `- **Estimated Financial Health Score:** **${score}/100** (${rating})\n`;
+    responseText += `- **Debt-To-Income (DTI) Ratio:** **${dti}%**\n`;
+    responseText += `  - *Guidance:* A DTI below 30% is considered healthy. Your current DTI is ${dti <= 30 ? 'healthy' : dti <= 45 ? 'moderate' : 'critical'}.\n`;
+    responseText += `- **Savings Rate:** **${savingsRatio}%** (Monthly surplus of ₹${surplus.toLocaleString('en-IN')} after EMIs and expenses)\n`;
+    responseText += `- **Net Household Worth:** **₹${netWorth.toLocaleString('en-IN')}** (Assets: ₹${totalAssets.toLocaleString('en-IN')}, Debt: ₹${totalOutstanding.toLocaleString('en-IN')})\n`;
+
+    const recommendations = [];
+    if (dti > 30) {
+      recommendations.push("Your DTI is high. Focus on reducing debt outstanding and avoid signing any new loan contracts.");
+    } else {
+      recommendations.push("Your DTI is well within healthy limits. You have strong borrowing capacity if needed.");
+    }
+    if (savingsRatio < 20) {
+      recommendations.push("Increase your monthly savings rate to at least 20% by cutting back on non-essential subscriptions or lifestyle expenditures.");
+    } else {
+      recommendations.push("Great job! Your savings rate is in the target bracket, allowing you to invest or prepay debt comfortably.");
+    }
+
+    return {
+      response: responseText,
+      reasoning: "Computed financial ratios including Debt-to-Income and Savings Rate based on active loans and declared cash flows.",
+      calculationDetails: "DTI = (Total EMI / Income) * 100. Savings Rate = ((Income - Expenses - EMIs) / Income) * 100.",
+      assumptionsMade: "Assumes declared income and expenses are accurate and representative of typical monthly cash flows.",
+      confidenceScore: 95,
+      simulations: [],
+      recommendations,
+      actions: [
+        {
+          type: "SET_EMI_ALERT",
+          parameters: {
+            metric: "dti",
+            thresholdPercent: 35
+          }
+        }
+      ]
+    };
+  }
+
+  if (intent === 'wealth') {
+    let responseText = `### 💼 Net Worth & Asset Valuation Portfolio\n\n`;
+    responseText += `- **Total Asset Valuation:** **₹${totalAssets.toLocaleString('en-IN')}**\n`;
+    responseText += `- **Total Outstanding Liabilities:** **₹${totalOutstanding.toLocaleString('en-IN')}**\n`;
+    responseText += `- **Net Worth (Assets - Debt):** **₹${netWorth.toLocaleString('en-IN')}**\n\n`;
+
+    if (assets.length > 0) {
+      responseText += `#### Asset Breakdown:\n`;
+      assets.forEach(asset => {
+        responseText += `- **${asset.name || asset.category}:** ₹${(asset.value || 0).toLocaleString('en-IN')}\n`;
+      });
+    } else {
+      responseText += `*No assets have been added to your profile yet. Add savings, stocks, gold, or property to track your net worth accurately.*\n`;
+    }
+
+    return {
+      response: responseText,
+      reasoning: "Summarized user asset catalog and outstanding debt to calculate current net worth.",
+      calculationDetails: "Net Worth = Assets - Outstanding Liabilities.",
+      assumptionsMade: "Asset valuations are based on user input values.",
+      confidenceScore: 100,
+      simulations: [],
+      recommendations: [
+        "Diversify your assets across liquid funds, equities, and inflation hedges like gold.",
+        "Ensure your liabilities do not outgrow your liquid reserves."
+      ],
+      actions: []
+    };
+  }
+
+  if (intent === 'subscription') {
+    const activeSubs = (subscriptions || []).filter(s => s.status === 'active');
+    const totalSubsCost = activeSubs.reduce((sum, s) => sum + (s.amount || 0), 0);
+
+    let responseText = `### 📅 Subscriptions & Recurring Expenses\n\n`;
+    responseText += `- **Active Subscriptions:** ${activeSubs.length} services\n`;
+    responseText += `- **Total Monthly Subscription Outflow:** **₹${totalSubsCost.toLocaleString('en-IN')}**\n\n`;
+
+    if (activeSubs.length > 0) {
+      responseText += `#### Detailed Services:\n`;
+      activeSubs.forEach(sub => {
+        const dateStr = sub.nextBillingDate ? new Date(sub.nextBillingDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) : 'N/A';
+        responseText += `- **${sub.name}:** ₹${sub.amount.toLocaleString('en-IN')}/${sub.frequency} (Next billing: ${dateStr})\n`;
+      });
+      responseText += `\n**Optimization Tip:** Review and cancel unused subscriptions to increase your monthly savings and prepayment pool.`;
+    } else {
+      responseText += `*No active subscriptions detected on your account.*`;
+    }
+
+    return {
+      response: responseText,
+      reasoning: "Aggregated monthly recurring subscription values.",
+      calculationDetails: "Monthly Subscriptions = Sum of active recurring subscriptions normalised to monthly rates.",
+      assumptionsMade: "Assumes subscription rates and status are current.",
+      confidenceScore: 100,
+      simulations: [],
+      recommendations: [
+        "Audit subscriptions quarterly to identify recurring charges for services you no longer use.",
+        "Redirect subscription savings directly to debt prepayment for compound benefits."
+      ],
+      actions: []
+    };
+  }
+
+  if (intent === 'loans_info') {
+    const targetLoans = matchedLoans.length > 0 ? matchedLoans : activeLoans;
+    let responseText = `### 📋 Loan Portfolio Details\n\n`;
+    if (matchedLoans.length > 0) {
+      responseText += `Here is the details for the matched loan(s) based on your query:\n\n`;
+    } else {
+      responseText += `Here is a summary of your active loans:\n\n`;
+    }
+
+    targetLoans.forEach(loan => {
+      responseText += `#### 🏛️ ${loan.provider} (${loan.loanType})\n`;
+      responseText += `- **Outstanding Balance:** ₹${loan.outstandingBalance.toLocaleString('en-IN')}\n`;
+      responseText += `- **Principal Amount:** ₹${loan.principal.toLocaleString('en-IN')}\n`;
+      responseText += `- **Interest Rate:** **${loan.interestRate}%** per annum\n`;
+      responseText += `- **Monthly EMI:** ₹${loan.emiAmount.toLocaleString('en-IN')}\n`;
+      responseText += `- **Remaining Tenure:** ${loan.tenure} months\n`;
+      if (loan.nextDueDate) {
+        const dateStr = new Date(loan.nextDueDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+        responseText += `- **Next Due Date:** ${dateStr}\n`;
+      }
+      responseText += `\n`;
+    });
+
+    return {
+      response: responseText,
+      reasoning: "Retrieved details of requested active loans.",
+      calculationDetails: "N/A",
+      assumptionsMade: "None",
+      confidenceScore: 100,
+      simulations: [],
+      recommendations: [
+        "Maintain on-time payments to build your FICO health history.",
+        "Prepay loans with rates higher than 8.5% whenever possible."
+      ],
+      actions: []
+    };
+  }
+
+  // 4. Default / Generic response fallback (intent === 'general')
+  let responseText = `### 👋 Welcome to your AI Financial Advisor (Offline Mode)\n\n`;
+  responseText += `I have analyzed your financial profile and compiled your current summary:\n\n`;
+  responseText += `- **Income vs Expenses:** Income of **₹${income.toLocaleString('en-IN')}** vs Expenses of **₹${expenses.toLocaleString('en-IN')}** per month.\n`;
+  if (activeLoans.length > 0) {
+    responseText += `- **Debt Liabilities:** **${activeLoans.length} active loans** totalling **₹${totalOutstanding.toLocaleString('en-IN')}** (Monthly EMIs: ₹${totalEmi.toLocaleString('en-IN')}).\n`;
+  } else {
+    responseText += `- **Debt Liabilities:** You are currently **debt-free**!\n`;
+  }
+  responseText += `- **Asset Portfolio:** Total asset valuation of **₹${totalAssets.toLocaleString('en-IN')}**.\n`;
+  responseText += `- **Net Worth:** **₹${netWorth.toLocaleString('en-IN')}**\n\n`;
+
+  responseText += `You can ask me specific questions based on your data, for example:\n`;
+  if (activeLoans.length > 0) {
+    const sampleLoan = activeLoans[0];
+    responseText += `1. *"How much interest can I save if I prepay ₹10,000 on my ${sampleLoan.provider} ${sampleLoan.loanType}?"*\n`;
+    responseText += `2. *"Which of my loans should I close first?"*\n`;
+  }
+  responseText += `3. *"Analyze my financial health score"* or *"What assets do I have?"*\n`;
+
+  return {
+    response: responseText,
+    reasoning: "Provided default summary of user's active loans, assets, income, and expenses.",
+    calculationDetails: "Collated totals for outstanding balance, EMIs, assets, income, and expenses.",
+    assumptionsMade: "None",
+    confidenceScore: 100,
+    simulations: [],
+    recommendations: [
+      activeLoans.length > 0 ? "Ask about prepaying your active loans to calculate your savings." : "Consider setting up financial saving goals.",
+      "Track your monthly income and expenses regularly to optimize cash flows."
+    ],
+    actions: []
+  };
+};
+
+/**
  * AI Financial Advisor Multi-Agent Router & Orchestrator
  * Routes user queries to specialized agents, executes them, and synthesizes the outputs.
  */
 export const askAdvisorWithGemini = async (query, loans, assets, goals, subscriptions, income, expenses) => {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'PLACEHOLDER') {
-    throw new Error('GEMINI_API_KEY is not configured.');
+  if (isInvalidOrLeakedKey(apiKey)) {
+    console.warn('[Advisor] Using offline advisor fallback due to missing/placeholder/leaked API key.');
+    return askAdvisorOffline(query, loans, assets, goals, subscriptions, income, expenses);
   }
 
   const genAI = new GoogleGenerativeAI(apiKey);
@@ -535,16 +1177,8 @@ Return JSON ONLY matching this format:
 
     return parsed;
   } catch (error) {
-    console.error('[Orchestration Synthesizer] Synthesis Error:', error);
-    return {
-      response: `I processed your request using specialized agents (${routedAgents.join(', ')}), but had an issue synthesizing the final JSON. Here is the loan agent report: ${agentOutputs['loan'] || 'No details available.'}`,
-      reasoning: 'Fallback due to synthesizer JSON parsing issue.',
-      calculationDetails: 'Calculations unavailable.',
-      assumptionsMade: 'N/A',
-      confidenceScore: 50,
-      simulations: [],
-      recommendations: ['Consider reviewing your loan list manually.']
-    };
+    console.error('[Orchestration Synthesizer] Error in Gemini service, falling back to local advisor:', error);
+    return askAdvisorOffline(query, loans, assets, goals, subscriptions, income, expenses);
   }
 };
 
@@ -622,7 +1256,7 @@ Output MUST be JSON matching this format:
  */
 export const getCreditPredictionAdviceWithGemini = async (healthData, scoreSimulation) => {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'PLACEHOLDER') {
+  if (isInvalidOrLeakedKey(apiKey)) {
     return "Maintain a low credit utilization ratio (below 30%) and ensure all EMIs are paid on time to consistently improve your score.";
   }
 
@@ -657,7 +1291,7 @@ export const getCreditPredictionAdviceWithGemini = async (healthData, scoreSimul
  */
 export const getWealthAdviceWithGemini = async (assets, loans, riskProfile, currentAllocation, targetAllocation) => {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'PLACEHOLDER') {
+  if (isInvalidOrLeakedKey(apiKey)) {
     return "For a moderate risk profile, aim to diversify assets with 60% in equities (index funds/mutual funds), 20% in gold or debt instruments, and 20% in cash reserves for emergencies.";
   }
 

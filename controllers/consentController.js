@@ -4,12 +4,12 @@ import Consent from '../models/Consent.js';
 
 export const requestConsentController = async (req, res) => {
   try {
-    const { vua } = req.body;
+    const { vua, bankId } = req.body;
     if (!vua) {
       return res.status(400).json({ message: 'VUA (Virtual Unified Address) is required' });
     }
 
-    const consent = await accountAggregatorService.requestConsent(req.user._id, vua);
+    const consent = await accountAggregatorService.requestConsent(req.user._id, vua, bankId);
 
     // Log the security/data consent creation
     await logSecurityEvent(req, {
