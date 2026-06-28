@@ -8,12 +8,13 @@ import Subscription from '../models/Subscription.js';
 import Transaction from '../models/Transaction.js';
 import FraudAlert from '../models/FraudAlert.js';
 import { logSecurityEvent } from '../utils/securityAudit.js';
+import sendEmail from '../utils/sendEmail.js';
 
 // Helper to generate access and refresh tokens
 const generateSessionTokens = async (req, res, user) => {
-  // Access Token (short-lived: 15 minutes)
+  // Access Token (extended to 7 days for stable testing/usage)
   const accessToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-    expiresIn: '15m',
+    expiresIn: '7d',
   });
 
   // Refresh Token (long-lived: 30 days)
@@ -39,7 +40,7 @@ const generateSessionTokens = async (req, res, user) => {
     httpOnly: true,
     secure: process.env.NODE_ENV !== 'development',
     sameSite: 'strict',
-    maxAge: 15 * 60 * 1000, // 15 minutes
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
   });
 
   res.cookie('refreshToken', refreshToken, {
@@ -363,7 +364,7 @@ export const refreshSession = async (req, res) => {
     user.refreshTokens.splice(tokenIndex, 1);
 
     // Create new tokens
-    const newAccessToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '15m' });
+    const newAccessToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
     const newTokenHash = crypto.randomBytes(32).toString('hex');
     const newRefreshToken = jwt.sign({ id: user._id, tokenHash: newTokenHash }, refreshSecret, { expiresIn: '30d' });
 
@@ -381,7 +382,7 @@ export const refreshSession = async (req, res) => {
       httpOnly: true,
       secure: process.env.NODE_ENV !== 'development',
       sameSite: 'strict',
-      maxAge: 15 * 60 * 1000 // 15 minutes
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
     });
 
     res.cookie('refreshToken', newRefreshToken, {
@@ -474,5 +475,104 @@ export const updateConsent = async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
+  }
+};
+
+// @desc    Forgot Password
+// @route   POST /api/auth/forgotpassword
+// @access  Public
+export const forgotPassword = async (req, res) => {
+  const { email } = req.body;
+
+  try {
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      return res.status(404).json({ message: 'There is no user with that email' });
+    }
+
+    // Get reset token
+    const resetToken = user.getResetPasswordToken();
+
+    await user.save({ validateBeforeSave: false });
+
+    // Create reset url
+    // Frontend URL could be derived from an env variable or origin
+    const origin = req.headers.origin || 'http://localhost:5173';
+    const resetUrl = `${origin}/?resetToken=${resetToken}`;
+
+    const message = `You are receiving this email because you (or someone else) has requested the reset of a password. Please make a PUT request to: \n\n ${resetUrl}`;
+
+    try {
+      await sendEmail({
+        email: user.email,
+        subject: 'Password reset token',
+        message,
+        html: `<p>You requested a password reset</p><p>Click this <a href="${resetUrl}">link</a> to reset your password.</p>`
+      });
+
+      res.status(200).json({ 
+        success: true, 
+        data: 'Email sent'
+      });
+    } catch (err) {
+      console.error(err);
+      user.resetPasswordToken = undefined;
+      user.resetPasswordExpire = undefined;
+
+      await user.save({ validateBeforeSave: false });
+
+      return res.status(500).json({ message: 'Email could not be sent' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Reset Password
+// @route   PUT /api/auth/resetpassword/:resettoken
+// @access  Public
+export const resetPassword = async (req, res) => {
+  try {
+    // Get hashed token
+    const resetPasswordToken = crypto
+      .createHash('sha256')
+      .update(req.params.resettoken)
+      .digest('hex');
+
+    const user = await User.findOne({
+      resetPasswordToken,
+      resetPasswordExpire: { $gt: Date.now() },
+    });
+
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid or expired reset token' });
+    }
+
+    if (!req.body.password) {
+      return res.status(400).json({ message: 'Please provide a new password' });
+    }
+
+    // Set new password
+    user.password = req.body.password;
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpire = undefined;
+    
+    // We can wipe out trusted devices or active sessions on password reset for security,
+    // but for now let's just save.
+    await user.save();
+
+    const token = await generateSessionTokens(req, res, user);
+
+    res.status(200).json({
+      success: true,
+      message: 'Password updated successfully',
+      token,
+      _id: user._id,
+      name: user.name,
+      email: user.email
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };

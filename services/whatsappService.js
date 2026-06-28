@@ -1,15 +1,12 @@
 import mongoose from 'mongoose';
 import User from '../models/User.js';
 import WhatsAppLog from '../models/WhatsAppLog.js';
+import { getWAClient } from './openwaClient.js';
+import { WhatsAppTemplates, replacePlaceholders } from '../templates/whatsappTemplates.js';
 
-/**
- * Sends a regular free-text message.
- * Gated by process.env.MOCK_WHATSAPP.
- */
 export const sendWhatsAppMessage = async (to, message, userId = null) => {
-  const isMock = process.env.MOCK_WHATSAPP === 'true';
   const cleanNumber = to || '[Not Specified]';
-  console.log(`[WhatsApp Service] Sending outbound alert to: ${cleanNumber}. Mock Mode: ${isMock}`);
+  console.log(`[WhatsApp Service] Sending outbound alert to: ${cleanNumber}`);
 
   let resolvedUserId = userId;
   if (!resolvedUserId) {
@@ -24,110 +21,91 @@ export const sendWhatsAppMessage = async (to, message, userId = null) => {
     }
   }
 
-  if (isMock) {
-    try {
-      const log = await WhatsAppLog.create({
-        userId: resolvedUserId || new mongoose.Types.ObjectId(),
-        message,
-        status: 'MOCK_SENT',
-      });
-      return {
-        success: true,
-        messageId: 'wa_mock_' + log._id,
-        timestamp: new Date().toISOString()
-      };
-    } catch (err) {
-      console.error('[WhatsApp Service] Failed to log mock WhatsApp:', err.message);
-      return { success: false, error: err.message };
-    }
+  try {
+    const client = getWAClient();
+    const formattedNumber = cleanNumber.replace(/[^0-9]/g, '');
+    
+    // Send text via OpenWA
+    const messageId = await client.sendText(`${formattedNumber}@c.us`, message);
+
+    await WhatsAppLog.create({
+      userId: resolvedUserId || new mongoose.Types.ObjectId(),
+      message,
+      status: 'SENT',
+    });
+
+    console.log(`[WhatsApp Service] Message to ${formattedNumber} sent successfully via OpenWA.`);
+    return {
+      success: true,
+      messageId: typeof messageId === 'string' ? messageId : 'wa_openwa_' + Math.random().toString(36).substring(2, 11),
+      timestamp: new Date().toISOString()
+    };
+  } catch (err) {
+    console.error(`[WhatsApp Service] OpenWA transmission failed: ${err.message}`);
+    
+    await WhatsAppLog.create({
+      userId: resolvedUserId || new mongoose.Types.ObjectId(),
+      message,
+      status: 'FAILED',
+    });
+    
+    return { success: false, error: err.message };
   }
-  
-  // 1. Integrates with Twilio API when credentials exist:
-  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-    try {
-      const client = (await import('twilio')).default(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-      await client.messages.create({
-        body: message,
-        from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER || '+14155238886'}`,
-        to: `whatsapp:${to.startsWith('+') ? to : '+' + to}`
-      });
-      console.log(`[WhatsApp Service] Twilio message to ${to} sent successfully.`);
-      return {
-        success: true,
-        messageId: 'wa_twilio_' + Math.random().toString(36).substring(2, 11),
-        timestamp: new Date().toISOString()
-      };
-    } catch (err) {
-      console.error(`[WhatsApp Service] Twilio transmission failed: ${err.message}`);
-    }
-  }
-  
-  return {
-    success: true,
-    messageId: 'wa_mock_fallback_' + Math.random().toString(36).substring(2, 11),
-    timestamp: new Date().toISOString()
-  };
 };
 
 /**
- * Sends an official Meta WhatsApp Business Cloud API Template Message.
- * Supported Templates: emi_due_reminder, loan_summary, missed_emi, credit_alert, monthly_report.
+ * Maps legacy / shorthand template names to our WhatsAppTemplates registry keys.
  */
+const TEMPLATE_NAME_MAP = {
+  'hello_world':       'WELCOME',
+  'welcome':           'WELCOME',
+  'emi_due_reminder':  'EMI_DUE_TOMORROW',
+  'emi_due_today':     'EMI_DUE_TODAY',
+  'emi_paid':          'EMI_PAID',
+  'loan_closed':       'LOAN_CLOSED',
+  'missed_payment':    'MISSED_PAYMENT',
+  'monthly_summary':   'MONTHLY_SUMMARY',
+  'autopay_failed':    'AUTOPAY_FAILED',
+  'autopay_success':   'AUTOPAY_SUCCESS',
+  'credit_tips':       'CREDIT_TIPS',
+  'credit_alert':      'CREDIT_TIPS',
+};
+
 export const sendWhatsAppTemplate = async (to, templateName, languageCode = 'en_US', components = [], userId = null) => {
-  const token = process.env.META_WA_ACCESS_TOKEN;
-  const phoneNumberId = process.env.META_WA_PHONE_NUMBER_ID || process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const cleanNumber = to.replace(/[^0-9]/g, ''); // Numeric digits only
+  console.log(`[WhatsApp Service] Resolving template "${templateName}" from registry...`);
 
-  const isMock = process.env.MOCK_WHATSAPP === 'true';
-  console.log(`[WhatsApp Meta API] Sending template "${templateName}" to phone "${cleanNumber}". Mock Mode: ${isMock}`);
+  // Resolve template from our custom registry
+  const registryKey = TEMPLATE_NAME_MAP[templateName] || templateName.toUpperCase();
+  const templateBody = WhatsAppTemplates[registryKey];
 
-  if (isMock) {
-    let simulatedText = `[Template: ${templateName}] Params: ${JSON.stringify(components)}`;
-    if (templateName === 'emi_due_reminder') {
-      simulatedText = `🔔 *EMI Due Alert*:\nYour EMI payment is scheduled soon. Please ensure your account balance is sufficient.`;
-    } else if (templateName === 'credit_alert') {
-      simulatedText = `⚠️ *Credit Score Alert*:\nAn event has occurred that might impact your credit bureau score. Check the dashboard.`;
-    }
-    return sendWhatsAppMessage(to, simulatedText, userId);
-  }
+  let messageText;
 
-  if (token && phoneNumberId) {
-    try {
-      const url = `https://graph.facebook.com/v17.0/${phoneNumberId}/messages`;
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          to: cleanNumber,
-          type: 'template',
-          template: {
-            name: templateName,
-            language: {
-              code: languageCode
-            },
-            components
-          }
-        })
+  if (templateBody) {
+    // Build placeholder data from components array (each item is { key, value })
+    const placeholderData = {};
+    if (Array.isArray(components)) {
+      components.forEach(c => {
+        if (c && c.key) placeholderData[c.key] = c.value;
       });
-
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error?.message || 'Meta WhatsApp API error response');
-      }
-      console.log(`[WhatsApp Meta API] Template "${templateName}" sent successfully. Meta Msg ID: ${data.messages?.[0]?.id}`);
-      return { success: true, messageId: data.messages?.[0]?.id };
-    } catch (err) {
-      console.error(`[WhatsApp Meta API] Failed to transmit template message:`, err.message);
-      return { success: false, error: err.message };
     }
+    // Resolve user name if not provided in components
+    if (!placeholderData.name && userId) {
+      try {
+        const user = await User.findById(userId);
+        if (user) placeholderData.name = user.name || 'Customer';
+      } catch (_) { /* ignore */ }
+    }
+    messageText = replacePlaceholders(templateBody, placeholderData);
+    console.log(`[WhatsApp Service] Resolved template "${registryKey}" → ${messageText.length} chars`);
+  } else {
+    // Fallback for unknown templates
+    messageText = `*${templateName.replace(/_/g, ' ').toUpperCase()}*\n\nThis is an automated notification from EMI Intelligence.`;
+    if (components && components.length > 0) {
+      messageText += `\n\nDetails:\n` + JSON.stringify(components, null, 2);
+    }
+    console.log(`[WhatsApp Service] Template "${templateName}" not found in registry, using fallback.`);
   }
 
-  // Fallback to text message simulation
-  console.log(`[WhatsApp Service] Meta Cloud API credentials missing. Simulating template dispatch...`);
-  let simulatedText = `[Template: ${templateName}] Params: ${JSON.stringify(components)}`;
-  return sendWhatsAppMessage(to, simulatedText, userId);
+  // Use the standard send message function
+  return sendWhatsAppMessage(to, messageText, userId);
 };

@@ -10,7 +10,11 @@ const notificationOutboxSchema = new mongoose.Schema(
     loanId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Loan',
-      required: true,
+      required: false,
+    },
+    template: {
+      type: String,
+      default: null,
     },
     chatId: {
       type: String,

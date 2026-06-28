@@ -11,17 +11,20 @@ import EmailLog from '../models/EmailLog.js';
 import PushNotificationLog from '../models/PushNotificationLog.js';
 import DocumentParseLog from '../models/DocumentParseLog.js';
 import AlertRule from '../models/AlertRule.js';
-import { askAdvisorWithGemini, analyzeStatementWithGemini, getCreditPredictionAdviceWithGemini, getWealthAdviceWithGemini } from '../services/geminiService.js';
+import Document from '../models/Document.js';
+import DocumentChunk from '../models/DocumentChunk.js';
+import { askAdvisorWithGemini, analyzeStatementWithGemini, getCreditPredictionAdviceWithGemini, getWealthAdviceWithGemini, getDynamicHealthScoreWithGemini } from '../services/geminiService.js';
 import { checkAndIncrementBudget } from '../utils/aiBudgetManager.js';
 import { generateFinancialReportPDF } from '../services/pdfService.js';
 import { calculateCreditScore, simulateCreditProjections, simulateScenario } from '../services/creditEngine.js';
 import { calculateSipFutureValue, analyzeEmergencyFund, analyzeAssetAllocation, projectWealthGrowth } from '../services/financialPlannerService.js';
+import { queueDocumentIndexing, retrieveRelevantChunks } from '../services/ragService.js';
 
 // @desc    Ask AI Advisor for customized advice
 // @route   POST /api/intelligence/advisor
 // @access  Private
 export const askAdvisor = async (req, res) => {
-  const { query } = req.body;
+  const { query, useRag } = req.body;
   try {
     // Check and update AI budget to prevent abuse
     await checkAndIncrementBudget(req.user._id, 1500);
@@ -31,6 +34,32 @@ export const askAdvisor = async (req, res) => {
     const goals = await Goal.find({ userId: req.user._id });
     const subscriptions = await Subscription.find({ userId: req.user._id });
     
+    // Retrieve relevant chunks if RAG is requested
+    let context = '';
+    let sources = [];
+    if (useRag) {
+      const { chunks, retrievalStatus } = await retrieveRelevantChunks(req.user._id, query);
+      if (retrievalStatus === 'matched' && chunks && chunks.length > 0) {
+        const MAX_CONTEXT_CHARS = 6000;
+        let currentChars = 0;
+        const selectedChunks = [];
+        for (const chunk of chunks) {
+          if (currentChars + chunk.content.length > MAX_CONTEXT_CHARS) {
+            break;
+          }
+          selectedChunks.push(chunk);
+          currentChars += chunk.content.length;
+        }
+        context = selectedChunks.map(c => `[Source Document: ${c.documentName}]\n${c.content}`).join('\n\n');
+        sources = selectedChunks.map(c => ({
+          documentName: c.documentName,
+          score: c.similarity
+        }));
+      } else {
+        context = 'No relevant document context was found. Answer using general financial knowledge and clearly state that uploaded documents did not contain relevant information.';
+      }
+    }
+
     const advice = await askAdvisorWithGemini(
       query,
       loans,
@@ -38,7 +67,8 @@ export const askAdvisor = async (req, res) => {
       goals,
       subscriptions,
       req.user.income || 0,
-      req.user.expenses || 0
+      req.user.expenses || 0,
+      context
     );
 
     // Process actions if requested by the AI
@@ -189,7 +219,7 @@ export const askAdvisor = async (req, res) => {
       }
     }
 
-    res.json(advice);
+    res.json({ ...advice, sources });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -427,84 +457,32 @@ export const getHealthScore = async (req, res) => {
   try {
     const loans = await Loan.find({ userId: req.user._id });
     const assets = await Asset.find({ userId: req.user._id });
+    const goals = await Goal.find({ userId: req.user._id });
+    const subscriptions = await Subscription.find({ userId: req.user._id });
 
     const totalIncome = req.user.income || 50000;
     const expenses = req.user.expenses || 15000;
+    const creditScore = 750; // Dynamic default
 
-    if (loans.length === 0 && assets.length === 0) {
-      return res.json({
-        healthScore: 100,
-        rating: 'Excellent',
-        debtToIncomeRatio: 0,
-        paymentConsistency: 100,
-        creditUtilization: 0,
-        loanDiversityScore: 100,
-        defaultRisk: 'Low',
-        explanation: 'You currently have no active liabilities or declared assets. Your financial and credit health is outstanding!',
-      });
-    }
+    // Check and update AI budget (low cost calculation)
+    await checkAndIncrementBudget(req.user._id, 1000);
 
-    let cashSum = 0;
-    let equitySum = 0;
-    let goldSum = 0;
-    let otherSum = 0;
+    const healthAnalysis = await getDynamicHealthScoreWithGemini(
+      loans,
+      assets,
+      goals,
+      subscriptions,
+      totalIncome,
+      expenses,
+      creditScore
+    );
 
-    assets.forEach(asset => {
-      const cat = (asset.category || '').toLowerCase();
-      const val = asset.value || 0;
-      if (cat.includes('cash') || cat.includes('bank') || cat.includes('savings')) {
-        cashSum += val;
-      } else if (cat.includes('stock') || cat.includes('mutual') || cat.includes('equity') || cat.includes('crypto')) {
-        equitySum += val;
-      } else if (cat.includes('gold') || cat.includes('commodity')) {
-        goldSum += val;
-      } else {
-        otherSum += val;
-      }
-    });
-
-    const totalAssets = cashSum + equitySum + goldSum + otherSum;
+    // Basic calculation for backward compatible sub-metrics in UI
     const totalEmi = loans.reduce((sum, l) => l.status === 'active' ? sum + l.emiAmount : sum, 0);
     const totalOutstanding = loans.reduce((sum, l) => sum + l.outstandingBalance, 0);
     const totalPrincipal = loans.reduce((sum, l) => sum + l.principal, 0);
-
-    // 1. Savings Ratio - 20 points
-    const surplus = Math.max(0, totalIncome - expenses - totalEmi);
-    const savingsRatio = totalIncome > 0 ? surplus / totalIncome : 0;
-    const savingsScore = Math.min(20, Math.max(0, Math.round((savingsRatio / 0.3) * 20)));
-
-    // 2. Debt Ratio - 20 points
-    const debtToAsset = totalAssets > 0 ? (totalOutstanding / totalAssets) : (totalOutstanding > 0 ? 1 : 0);
-    const debtRatioScore = totalOutstanding === 0 ? 20 : (totalAssets > 0 ? Math.round(Math.min(20, Math.max(0, 20 * (1 - debtToAsset)))) : 0);
-
-    // 3. Emergency Coverage - 20 points
-    const monthsCovered = expenses > 0 ? (cashSum / expenses) : 6;
-    const emergencyScore = Math.round(Math.min(20, Math.max(0, (monthsCovered / 6) * 20)));
-
-    // 4. EMI Burden - 20 points
     const dti = totalIncome > 0 ? (totalEmi / totalIncome) * 100 : 0;
-    let emiBurdenScore = 20;
-    if (dti > 50) emiBurdenScore = 0;
-    else if (dti > 40) emiBurdenScore = 5;
-    else if (dti > 30) emiBurdenScore = 10;
-    else if (dti > 15) emiBurdenScore = 15;
-
-    // 5. Investment Ratio - 20 points
-    const investmentAssets = equitySum + goldSum + otherSum;
-    const investmentRatio = totalAssets > 0 ? (investmentAssets / totalAssets) : 0;
-    const investmentScore = totalAssets > 0 ? Math.round(Math.min(20, Math.max(0, (investmentRatio / 0.5) * 20))) : (totalIncome > expenses ? 10 : 0);
-
-    const healthScore = Math.round(savingsScore + debtRatioScore + emergencyScore + emiBurdenScore + investmentScore);
-
-    // Categorize
-    let rating = 'Critical';
-    let defaultRisk = 'High';
-    if (healthScore >= 85) { rating = 'Excellent'; defaultRisk = 'Low'; }
-    else if (healthScore >= 70) { rating = 'Good'; defaultRisk = 'Low'; }
-    else if (healthScore >= 50) { rating = 'Average'; defaultRisk = 'Medium'; }
-    else if (healthScore >= 30) { rating = 'Poor'; defaultRisk = 'High'; }
-
-    // Payment consistency (for backward compatibility / UI parameter list)
+    
     let totalExpectedPayments = 0;
     let totalPaidPayments = 0;
     loans.forEach(loan => {
@@ -517,27 +495,24 @@ export const getHealthScore = async (req, res) => {
       ? (totalPaidPayments / totalExpectedPayments) * 100 
       : 100;
 
-    // Credit utilization (for backward compatibility / UI parameter list)
     const creditUtilization = totalPrincipal > 0 
       ? (totalOutstanding / totalPrincipal) * 100 
       : 0;
 
-    // Diversity (for backward compatibility / UI parameter list)
     const uniqueTypes = new Set(loans.map(l => l.loanType));
     const diversityScore = Math.min(100, uniqueTypes.size * 35);
 
-    let explanation = `Your Credit Health Index is ${healthScore}/100 (${rating}). `;
-    explanation += `Breakdown: Savings Ratio (${savingsScore}/20), Debt Ratio (${debtRatioScore}/20), Emergency Cover (${emergencyScore}/20), EMI Burden (${emiBurdenScore}/20), Investment Ratio (${investmentScore}/20).`;
-
     res.json({
-      healthScore,
-      rating,
+      healthScore: healthAnalysis.healthScore,
+      rating: healthAnalysis.rating,
       debtToIncomeRatio: Math.round(dti),
       paymentConsistency: Math.round(paymentConsistency),
       creditUtilization: Math.round(creditUtilization),
       loanDiversityScore: Math.round(diversityScore),
-      defaultRisk,
-      explanation,
+      defaultRisk: healthAnalysis.defaultRisk,
+      explanation: healthAnalysis.explanation,
+      weights: healthAnalysis.weights,
+      recommendations: healthAnalysis.recommendations
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -1227,6 +1202,70 @@ export const getWealthProjection = async (req, res) => {
     );
 
     res.json(projections);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Upload document for RAG indexing
+// @route   POST /api/intelligence/documents
+// @access  Private
+export const uploadDocument = async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ message: 'No file uploaded.' });
+  }
+
+  try {
+    const doc = await Document.create({
+      userId: req.user._id,
+      name: req.file.originalname,
+      fileSize: req.file.size,
+      mimeType: req.file.mimetype,
+      status: 'processing',
+    });
+
+    // Start background queue-based processing
+    await queueDocumentIndexing(
+      req.user._id,
+      doc._id,
+      req.file.originalname,
+      req.file.buffer,
+      req.file.mimetype
+    );
+
+    res.status(201).json(doc);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Get user's uploaded documents
+// @route   GET /api/intelligence/documents
+// @access  Private
+export const getDocuments = async (req, res) => {
+  try {
+    const docs = await Document.find({ userId: req.user._id }).sort({ createdAt: -1 });
+    res.json(docs);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Delete document and its indexed chunks
+// @route   DELETE /api/intelligence/documents/:id
+// @access  Private
+export const deleteDocument = async (req, res) => {
+  try {
+    const doc = await Document.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!doc) {
+      return res.status(404).json({ message: 'Document not found.' });
+    }
+
+    // Delete chunks and then the document record
+    await DocumentChunk.deleteMany({ documentId: doc._id });
+    await Document.deleteOne({ _id: doc._id });
+
+    res.json({ message: 'Document and its indexed contents successfully deleted.' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

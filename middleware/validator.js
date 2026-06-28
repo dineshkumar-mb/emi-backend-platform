@@ -139,6 +139,7 @@ export const aiValidationResultSchema = z.object({
 // Zod schema for AI advisor queries
 export const advisorSchema = z.object({
   query: z.string().min(1, 'Query is required'),
+  useRag: z.boolean().optional().default(false),
 });
 
 // Zod schema for Assets CRUD

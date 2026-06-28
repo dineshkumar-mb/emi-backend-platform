@@ -10,6 +10,7 @@ import Asset from './models/Asset.js';
 import Transaction from './models/Transaction.js';
 import { structuredLogger } from './middleware/loggingMiddleware.js';
 import * as accountAggregatorService from './services/accountAggregatorService.js';
+import { getDynamicHealthScoreWithGemini } from './services/geminiService.js';
 
 dotenv.config();
 
@@ -191,6 +192,33 @@ const runNewTests = async () => {
       console.log = originalConsoleLog; // Restore in case of error
       assert('Structured logger parsing verification failed', false, e.message);
     }
+
+    // 6. Dynamic Financial Health Score Verification
+    console.log('\n🏥 Testing Dynamic Financial Health Score Evaluator...');
+    const healthResult = await getDynamicHealthScoreWithGemini(
+      [
+        {
+          provider: 'SBI',
+          loanType: 'Home Loan',
+          outstandingBalance: 1500000,
+          emiAmount: 18000,
+          interestRate: 8.5,
+          tenureMonths: 180,
+          status: 'active'
+        }
+      ],
+      [
+        { name: 'Emergency Fund', category: 'Savings', value: 90000 }
+      ],
+      [], // goals
+      [], // subscriptions
+      60000, // income
+      15000 // expenses
+    );
+    
+    assert('Health Score returns a score out of 100', typeof healthResult.healthScore === 'number' && healthResult.healthScore >= 0 && healthResult.healthScore <= 100);
+    assert('Health Score returns recommendations', Array.isArray(healthResult.recommendations) && healthResult.recommendations.length > 0);
+    assert('Health Score returns dynamic weights', healthResult.weights !== undefined && typeof healthResult.weights.emiBurdenWeight === 'number');
 
     // Cleanup all test records
     await Loan.deleteMany({ userId: user._id });

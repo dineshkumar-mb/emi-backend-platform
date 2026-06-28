@@ -33,15 +33,18 @@ const processWhatsAppJob = async (jobData) => {
     retryCount: jobData.retryCount || 0,
   });
 
-  if (loanId) {
-    await NotificationLog.create({
-      message: message || `Template notification: ${templateName}`,
-      userId: userId,
-      loanId: loanId,
-      status: statusStr.toLowerCase(),
-      deliveryId: deliveryIdStr,
-    });
-  }
+  // Log message to NotificationLog for tracking & analytics
+  await NotificationLog.create({
+    userId: userId || new mongoose.Types.ObjectId(),
+    phone: to || '0000000000',
+    template: templateName || 'CUSTOM_MESSAGE',
+    message: message || `[Template: ${templateName}]`,
+    loanId: loanId || null,
+    status: result.success ? 'delivered' : 'failed',
+    sentAt: new Date(),
+    deliveredAt: result.success ? new Date() : null,
+    failedReason: result.success ? null : (result.error || 'Failed to dispatch message'),
+  });
 
   if (!result.success) {
     throw new Error(result.error || 'Failed to dispatch message.');

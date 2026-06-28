@@ -413,6 +413,20 @@ export const syncConsentData = async (consentId) => {
     );
     syncedAssets.push(asset1);
 
+    const asset2 = await Asset.findOneAndUpdate(
+      { userId, name: 'SBI Mutual Fund' },
+      {
+        userId,
+        name: 'SBI Mutual Fund',
+        type: 'Investment',
+        category: 'Mutual Fund',
+        value: 75000,
+        interestRate: 12.0
+      },
+      { upsert: true, new: true }
+    );
+    syncedAssets.push(asset2);
+
     // 2. Sync SBI Loans
     const loan1 = await Loan.findOneAndUpdate(
       { userId, provider: 'State Bank of India', loanType: 'Home Loan' },

@@ -995,11 +995,15 @@ export const askAdvisorOffline = (query, loans = [], assets = [], goals = [], su
  * AI Financial Advisor Multi-Agent Router & Orchestrator
  * Routes user queries to specialized agents, executes them, and synthesizes the outputs.
  */
-export const askAdvisorWithGemini = async (query, loans, assets, goals, subscriptions, income, expenses) => {
+export const askAdvisorWithGemini = async (query, loans, assets, goals, subscriptions, income, expenses, context = '') => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (isInvalidOrLeakedKey(apiKey)) {
     console.warn('[Advisor] Using offline advisor fallback due to missing/placeholder/leaked API key.');
-    return askAdvisorOffline(query, loans, assets, goals, subscriptions, income, expenses);
+    const offlineResult = askAdvisorOffline(query, loans, assets, goals, subscriptions, income, expenses);
+    if (context) {
+      offlineResult.response += `\n\n---\n### 📄 Grounded Document Context (RAG Fallback)\nBased on your uploaded documents, the following relevant excerpt was retrieved:\n\n${context}`;
+    }
+    return offlineResult;
   }
 
   const genAI = new GoogleGenerativeAI(apiKey);
@@ -1109,6 +1113,8 @@ Output format:
   const synthesizerPrompt = `You are the Orchestration Synthesizer. You have routed the user's query: "${query}" to the following specialized sub-agents:
 ${Object.entries(agentOutputs).map(([agent, output]) => `=== Sub-Agent ${agent.toUpperCase()} Output ===\n${output}`).join('\n\n')}
 
+${context ? `=== Retrieved Knowledge Documents Context (RAG) ===\n${context}\n\nUse this context to ground your advice. Cite the source document names when using facts from them. If the context is not relevant to the query, ignore it.\n` : ''}
+
 User's Financial Profile (redacted):
 - Income: ${income} per month
 - Declared Expenses: ${expenses} per month
@@ -1117,7 +1123,7 @@ User's Financial Profile (redacted):
 - Subscriptions: ${JSON.stringify(sanitizedSubscriptions)}
 - Goals: ${JSON.stringify(sanitizedGoals)}
 
-Compile a unified, cohesive response merging the sub-agents' analysis. Address calculations, prepayment strategies, credit score projections, or rebalancing options if applicable.
+Compile a unified, cohesive response merging the sub-agents' analysis and the retrieved documents. Address calculations, prepayment strategies, credit score projections, or rebalancing options if applicable.
 
 You MUST follow explainable AI requirements. The response must include confidence scoring and reasoning breakdown.
 Additionally, you act as a Financial Copilot that can trigger actions. Determine if the user's query requests one of the following operations:
@@ -1178,7 +1184,11 @@ Return JSON ONLY matching this format:
     return parsed;
   } catch (error) {
     console.error('[Orchestration Synthesizer] Error in Gemini service, falling back to local advisor:', error);
-    return askAdvisorOffline(query, loans, assets, goals, subscriptions, income, expenses);
+    const offlineResult = askAdvisorOffline(query, loans, assets, goals, subscriptions, income, expenses);
+    if (context) {
+      offlineResult.response += `\n\n---\n### 📄 Grounded Document Context (RAG Fallback)\nBased on your uploaded documents, the following relevant excerpt was retrieved:\n\n${context}`;
+    }
+    return offlineResult;
   }
 };
 
@@ -1324,6 +1334,205 @@ export const getWealthAdviceWithGemini = async (assets, loans, riskProfile, curr
   } catch (error) {
     console.error('Wealth Advisor AI Error:', error);
     return "Rebalance your holdings by allocating monthly surplus to index funds to build equity exposure, and maintain a 3-month emergency fund in a liquid high-yield bank account.";
+  }
+};
+
+/**
+ * Offline Math Calculation for Health Score (JSON schema aligned)
+ */
+export const getOfflineHealthScore = (loans, assets, goals, subscriptions, income, expenses, creditScore = 750) => {
+  const totalEmi = loans.reduce((sum, l) => l.status === 'active' ? sum + l.emiAmount : sum, 0);
+  const totalOutstanding = loans.reduce((sum, l) => sum + l.outstandingBalance, 0);
+  
+  let cashSum = 0;
+  let investSum = 0;
+  assets.forEach(a => {
+    const cat = (a.category || '').toLowerCase();
+    const val = a.value || 0;
+    if (cat.includes('cash') || cat.includes('bank') || cat.includes('savings')) {
+      cashSum += val;
+    } else {
+      investSum += val;
+    }
+  });
+  
+  const totalAssets = cashSum + investSum;
+  
+  // 1. Savings Ratio (max 20)
+  const surplus = Math.max(0, income - expenses - totalEmi);
+  const savingsRatio = income > 0 ? surplus / income : 0;
+  const savingsScore = Math.min(20, Math.max(0, Math.round((savingsRatio / 0.3) * 20)));
+
+  // 2. Debt Ratio (max 20)
+  const debtToAsset = totalAssets > 0 ? (totalOutstanding / totalAssets) : (totalOutstanding > 0 ? 1 : 0);
+  const debtRatioScore = totalOutstanding === 0 ? 20 : (totalAssets > 0 ? Math.round(Math.min(20, Math.max(0, 20 * (1 - debtToAsset)))) : 0);
+
+  // 3. Emergency Coverage (max 20)
+  const monthsCovered = expenses > 0 ? (cashSum / expenses) : 6;
+  const emergencyScore = Math.round(Math.min(20, Math.max(0, (monthsCovered / 6) * 20)));
+
+  // 4. EMI Burden (max 20)
+  const dti = income > 0 ? (totalEmi / income) * 100 : 0;
+  let emiBurdenScore = 20;
+  if (dti > 50) emiBurdenScore = 0;
+  else if (dti > 40) emiBurdenScore = 5;
+  else if (dti > 30) emiBurdenScore = 10;
+  else if (dti > 15) emiBurdenScore = 15;
+
+  // 5. Investment Ratio (max 20)
+  const investmentRatio = totalAssets > 0 ? (investSum / totalAssets) : 0;
+  const investmentScore = totalAssets > 0 ? Math.round(Math.min(20, Math.max(0, (investmentRatio / 0.5) * 20))) : (income > expenses ? 10 : 0);
+
+  const healthScore = Math.round(savingsScore + debtRatioScore + emergencyScore + emiBurdenScore + investmentScore);
+
+  let rating = 'Critical';
+  let defaultRisk = 'High';
+  if (healthScore >= 85) { rating = 'Excellent'; defaultRisk = 'Low'; }
+  else if (healthScore >= 70) { rating = 'Good'; defaultRisk = 'Low'; }
+  else if (healthScore >= 50) { rating = 'Average'; defaultRisk = 'Medium'; }
+  else if (healthScore >= 30) { rating = 'Poor'; defaultRisk = 'High'; }
+
+  const recommendations = [];
+  if (emiBurdenScore < 15) {
+    recommendations.push({
+      category: 'Debt',
+      text: `Your EMI burden is ₹${totalEmi.toLocaleString()} (${Math.round(dti)}% of income). Consider debt consolidation or prepayments to lower this ratio below 30%.`,
+      priority: dti > 40 ? 'High' : 'Medium'
+    });
+  }
+  if (emergencyScore < 15) {
+    recommendations.push({
+      category: 'Savings',
+      text: `Your emergency liquid reserves cover only ${monthsCovered.toFixed(1)} months of expenses. Target building ₹${Math.round(expenses * 6).toLocaleString()} in liquid cash.`,
+      priority: 'High'
+    });
+  }
+  if (investmentScore < 12 && totalAssets > 0) {
+    recommendations.push({
+      category: 'Investments',
+      text: 'Your portfolio leans heavily towards liquid cash. Consider routing recurring savings into mutual funds or gold ETFs for inflation beating growth.',
+      priority: 'Medium'
+    });
+  }
+  if (recommendations.length === 0) {
+    recommendations.push({
+      category: 'General',
+      text: 'Maintain your excellent financial habits! Consider reviewing your long term retirement goals or rebalancing your investment portfolio annually.',
+      priority: 'Low'
+    });
+  }
+
+  return {
+    healthScore,
+    rating,
+    defaultRisk,
+    explanation: `Offline calculation details: Savings (${savingsScore}/20), Debt Ratio (${debtRatioScore}/20), Emergency reserves (${emergencyScore}/20), EMI Burden (${emiBurdenScore}/20), Investments (${investmentScore}/20).`,
+    weights: {
+      savingsRateWeight: 20,
+      debtToAssetWeight: 20,
+      emiBurdenWeight: 20,
+      emergencyFundWeight: 20,
+      investmentIndexWeight: 20
+    },
+    recommendations
+  };
+};
+
+/**
+ * Dynamic AI-weighted Financial Health Score
+ */
+export const getDynamicHealthScoreWithGemini = async (
+  loans,
+  assets,
+  goals,
+  subscriptions,
+  income,
+  expenses,
+  creditScore = 750
+) => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (isInvalidOrLeakedKey(apiKey)) {
+    return getOfflineHealthScore(loans, assets, goals, subscriptions, income, expenses, creditScore);
+  }
+
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.5-flash',
+    generationConfig: { responseMimeType: 'application/json' },
+  });
+
+  const loansSummary = loans.map(l => ({
+    provider: l.provider,
+    type: l.loanType,
+    outstanding: l.outstandingBalance,
+    emi: l.emiAmount,
+    rate: l.interestRate,
+    tenure: l.tenureMonths
+  }));
+
+  const assetsSummary = assets.map(a => ({
+    name: a.name,
+    category: a.category,
+    value: a.value
+  }));
+
+  const goalsSummary = goals.map(g => ({
+    name: g.name,
+    target: g.targetAmount,
+    current: g.currentAmount,
+    deadline: g.deadline
+  }));
+
+  const subscriptionsSummary = subscriptions.map(s => ({
+    name: s.name,
+    amount: s.amount
+  }));
+
+  const prompt = `You are an expert financial auditor. Review the user's financial profile:
+- Monthly Income: ₹${income}
+- Monthly Core Expenses: ₹${expenses}
+- Credit Score: ${creditScore}
+- Active Loans: ${JSON.stringify(loansSummary)}
+- Declared Assets: ${JSON.stringify(assetsSummary)}
+- Active Goals: ${JSON.stringify(goalsSummary)}
+- Subscriptions: ${JSON.stringify(subscriptionsSummary)}
+
+Your job is to:
+1. Dynamic Weighting: Evaluate all metrics and dynamically assign percentage weights depending on the profile characteristics (e.g. if debt is high, weight DTI higher; if savings are low, weight emergency cover higher).
+2. Calculate a Unified Financial Health Score from 0 to 100 based on:
+   - Savings Rate (surplus cash vs income)
+   - Debt-to-Asset ratio
+   - Debt-to-Income (DTI) ratio / EMI burden
+   - Emergency fund buffer size (cash assets divided by monthly core expenses)
+   - Portfolio investment index (invested assets vs liquid assets)
+3. Assign a Rating ("Excellent" | "Good" | "Average" | "Poor" | "Critical") and default risk ("Low" | "Medium" | "High").
+4. Formulate 3-4 highly specific, actionable recommendations to improve their financial health and lower debt.
+
+Return output strictly as a JSON object matching this schema:
+{
+  "healthScore": number,
+  "rating": "Excellent" | "Good" | "Average" | "Poor" | "Critical",
+  "defaultRisk": "Low" | "Medium" | "High",
+  "explanation": string (1-2 sentences summarizing breakdown),
+  "weights": {
+    "savingsRateWeight": number,
+    "debtToAssetWeight": number,
+    "emiBurdenWeight": number,
+    "emergencyFundWeight": number,
+    "investmentIndexWeight": number
+  },
+  "recommendations": [
+    { "category": "Debt" | "Savings" | "Investments" | "General", "text": string, "priority": "High" | "Medium" | "Low" }
+  ]
+}
+`;
+
+  try {
+    const result = await model.generateContent(prompt);
+    return JSON.parse(result.response.text().trim());
+  } catch (error) {
+    console.error('[Gemini Health Score] Error generating dynamic health score, falling back to offline:', error);
+    return getOfflineHealthScore(loans, assets, goals, subscriptions, income, expenses, creditScore);
   }
 };
 

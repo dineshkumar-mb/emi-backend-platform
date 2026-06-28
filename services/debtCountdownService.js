@@ -26,9 +26,22 @@ export const calculateDebtCountdown = (input) => {
   for (const loan of activeLoans) {
     const nextDue = loan.nextDueDate ? new Date(loan.nextDueDate) : new Date();
     
-    // Estimate remaining months based on outstanding balance / emiAmount
+    // Estimate remaining months based on exact financial formula to account for interest
     const emi = loan.emiAmount || (loan.outstandingBalance / 12) || 1;
-    const remainingMonths = Math.max(1, Math.ceil(loan.outstandingBalance / emi));
+    const annualRate = loan.interestRate || 0;
+    let remainingMonths = 1;
+
+    if (annualRate > 0) {
+      const r = annualRate / 12 / 100;
+      if (emi > loan.outstandingBalance * r) {
+        const remaining = Math.log(emi / (emi - loan.outstandingBalance * r)) / Math.log(1 + r);
+        remainingMonths = Math.max(1, Math.ceil(remaining));
+      } else {
+        remainingMonths = Math.max(1, Math.ceil(loan.outstandingBalance / emi));
+      }
+    } else {
+      remainingMonths = Math.max(1, Math.ceil(loan.outstandingBalance / emi));
+    }
 
     // Calculate closure date for this loan
     const closureDate = new Date(nextDue);

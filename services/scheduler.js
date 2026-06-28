@@ -19,6 +19,8 @@ import { sendPushNotification } from './pushNotificationService.js';
 import { sendSMS } from './smsService.js';
 import { calculateCreditScore } from './creditEngine.js';
 import { queueWhatsAppMessage } from './whatsappAutomationService.js';
+import NotificationLog from '../models/NotificationLog.js';
+import { WhatsAppTemplates, replacePlaceholders } from '../templates/whatsappTemplates.js';
 
 const getGeoFormatting = (geo) => {
   switch (geo) {
@@ -33,29 +35,29 @@ const getGeoFormatting = (geo) => {
 };
 
 /**
- * Sweep function to find active loans due in daysRemaining days and dispatch reminders.
+ * Sweep function to find active loans due tomorrow and dispatch reminders.
  */
-export const runEmiDueSweep = async (daysRemaining) => {
+export const runDueTomorrowSweep = async () => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
   const loans = await Loan.find({ status: 'active' }).populate('userId');
-  let processedCount = 0;
+  let queuedCount = 0;
 
   for (const loan of loans) {
     if (!loan.userId) continue;
-
     const user = loan.userId;
+
+    const userPrefs = user.notificationSettings || {};
+    if (userPrefs.emiReminders === false) continue;
+
     const dueDate = new Date(loan.nextDueDate);
     dueDate.setHours(0, 0, 0, 0);
 
     const diffTime = dueDate.getTime() - today.getTime();
     const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
-    if (diffDays === daysRemaining) {
-      const dayLabel = daysRemaining === 0 ? 'Today' : 'Tomorrow';
-      const title = `🔔 EMI Due Alert: Due ${dayLabel}`;
-      
+    if (diffDays === 1) { // Tomorrow
       const geo = user.geo || 'IN';
       const { symbol, locale } = getGeoFormatting(geo);
       const dueDateStr = dueDate.toLocaleDateString(locale, {
@@ -64,55 +66,324 @@ export const runEmiDueSweep = async (daysRemaining) => {
         year: 'numeric'
       });
 
-      const message = `Dear ${user.name || 'Customer'},\nYour EMI of ${symbol}${loan.emiAmount.toLocaleString(locale)} for your ${loan.loanType} loan with ${loan.provider} is due ${dayLabel.toLowerCase()} (${dueDateStr}). Please ensure sufficient balance.`;
+      const messageText = replacePlaceholders(WhatsAppTemplates.EMI_DUE_TOMORROW, {
+        name: user.name || 'Customer',
+        emiAmount: loan.emiAmount.toLocaleString(locale),
+        loanName: `${loan.provider} ${loan.loanType}`,
+        dueDate: dueDateStr
+      });
 
-      console.log(`[Scheduler Sweep] Dispatching EMI reminder to user ${user.email} (Due in ${daysRemaining} days)`);
+      const existing = await NotificationOutbox.findOne({
+        userId: user._id,
+        loanId: loan._id,
+        template: 'EMI_DUE_TOMORROW',
+        status: 'pending'
+      });
 
-      // 1. Send Push Notification
-      await sendPushNotification(user._id, title, message);
-
-      // 2. Send Email
-      await sendEmailReport(user.email, title, message, null, user._id);
-
-      // 3. Send SMS (via MockSMS / Twilio)
-      const phone = user.whatsappNumber || '0000000000';
-      await sendSMS(user._id, phone, message);
-
-      // 4. Send Mock WhatsApp if MOCK_WHATSAPP=true
-      if (process.env.MOCK_WHATSAPP === 'true') {
-        const { sendWhatsAppMessage } = await import('./whatsappService.js');
-        await sendWhatsAppMessage(phone, message, user._id);
+      if (!existing) {
+        await NotificationOutbox.create({
+          userId: user._id,
+          loanId: loan._id,
+          template: 'EMI_DUE_TOMORROW',
+          chatId: user.notificationChannel === 'WhatsApp' ? (user.whatsappNumber || '') : (user.telegramChatId || ''),
+          message: messageText,
+        });
+        queuedCount++;
       }
-
-      processedCount++;
     }
   }
-  return processedCount;
+  return queuedCount;
+};
+
+/**
+ * Sweep function to find active loans due today and dispatch reminders.
+ */
+export const runDueTodaySweep = async () => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const loans = await Loan.find({ status: 'active' }).populate('userId');
+  let queuedCount = 0;
+
+  for (const loan of loans) {
+    if (!loan.userId) continue;
+    const user = loan.userId;
+
+    const userPrefs = user.notificationSettings || {};
+    if (userPrefs.emiReminders === false) continue;
+
+    const dueDate = new Date(loan.nextDueDate);
+    dueDate.setHours(0, 0, 0, 0);
+
+    const diffTime = dueDate.getTime() - today.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+    if (diffDays === 0) { // Today
+      const geo = user.geo || 'IN';
+      const { symbol, locale } = getGeoFormatting(geo);
+
+      const messageText = replacePlaceholders(WhatsAppTemplates.EMI_DUE_TODAY, {
+        emiAmount: loan.emiAmount.toLocaleString(locale),
+        loanName: `${loan.provider} ${loan.loanType}`
+      });
+
+      const existing = await NotificationOutbox.findOne({
+        userId: user._id,
+        loanId: loan._id,
+        template: 'EMI_DUE_TODAY',
+        status: 'pending'
+      });
+
+      if (!existing) {
+        await NotificationOutbox.create({
+          userId: user._id,
+          loanId: loan._id,
+          template: 'EMI_DUE_TODAY',
+          chatId: user.notificationChannel === 'WhatsApp' ? (user.whatsappNumber || '') : (user.telegramChatId || ''),
+          message: messageText,
+        });
+        queuedCount++;
+      }
+    }
+  }
+  return queuedCount;
+};
+
+/**
+ * Sweep function to find overdue active loans and dispatch warnings.
+ */
+export const runOverdueSweep = async () => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const loans = await Loan.find({ status: 'active' }).populate('userId');
+  let queuedCount = 0;
+
+  for (const loan of loans) {
+    if (!loan.userId) continue;
+    const user = loan.userId;
+
+    const userPrefs = user.notificationSettings || {};
+    if (userPrefs.overdueAlerts === false) continue;
+
+    const dueDate = new Date(loan.nextDueDate);
+    dueDate.setHours(0, 0, 0, 0);
+
+    if (today > dueDate) { // Overdue
+      const diffTime = today.getTime() - dueDate.getTime();
+      const days = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+
+      if (days > 0) {
+        const geo = user.geo || 'IN';
+        const { symbol, locale } = getGeoFormatting(geo);
+
+        const messageText = replacePlaceholders(WhatsAppTemplates.MISSED_PAYMENT, {
+          loanName: `${loan.provider} ${loan.loanType}`,
+          emiAmount: loan.emiAmount.toLocaleString(locale),
+          days: days.toString()
+        });
+
+        const existing = await NotificationOutbox.findOne({
+          userId: user._id,
+          loanId: loan._id,
+          template: 'MISSED_PAYMENT',
+          status: 'pending'
+        });
+
+        if (!existing) {
+          await NotificationOutbox.create({
+            userId: user._id,
+            loanId: loan._id,
+            template: 'MISSED_PAYMENT',
+            chatId: user.notificationChannel === 'WhatsApp' ? (user.whatsappNumber || '') : (user.telegramChatId || ''),
+            message: messageText,
+          });
+          queuedCount++;
+        }
+      }
+    }
+  }
+  return queuedCount;
+};
+
+/**
+ * Sweep function to generate and queue monthly loan summaries for all users.
+ */
+export const runMonthlySummarySweep = async () => {
+  const users = await User.find({ whatsappNumber: { $exists: true, $ne: '' } });
+  let queuedCount = 0;
+
+  const now = new Date();
+  const prevMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const prevMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+
+  for (const user of users) {
+    try {
+      const userPrefs = user.notificationSettings || {};
+      if (userPrefs.monthlyReports === false) continue;
+
+      const userLoans = await Loan.find({ userId: user._id, status: 'active' });
+      const loanIds = userLoans.map(l => l._id);
+
+      const payments = await LoanPayment.find({
+        loanId: { $in: loanIds },
+        paymentDate: { $gte: prevMonthStart, $lte: prevMonthEnd },
+        paymentStatus: 'success',
+      });
+
+      const totalPaidLastMonth = payments.reduce((sum, p) => sum + p.emiAmount, 0);
+      const outstandingBalance = userLoans.reduce((sum, l) => sum + l.outstandingBalance, 0);
+
+      const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+      const currentMonthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+      const upcomingEmiCount = userLoans.filter(l => {
+        const d = new Date(l.nextDueDate);
+        return d >= currentMonthStart && d <= currentMonthEnd;
+      }).length;
+
+      const messageText = replacePlaceholders(WhatsAppTemplates.MONTHLY_SUMMARY, {
+        activeLoans: userLoans.length.toString(),
+        outstanding: outstandingBalance.toLocaleString('en-IN'),
+        paid: totalPaidLastMonth.toLocaleString('en-IN'),
+        upcoming: upcomingEmiCount.toString()
+      });
+
+      const existing = await NotificationOutbox.findOne({
+        userId: user._id,
+        template: 'MONTHLY_SUMMARY',
+        status: 'pending'
+      });
+
+      if (!existing) {
+        await NotificationOutbox.create({
+          userId: user._id,
+          template: 'MONTHLY_SUMMARY',
+          chatId: user.notificationChannel === 'WhatsApp' ? (user.whatsappNumber || '') : (user.telegramChatId || ''),
+          message: messageText,
+        });
+        queuedCount++;
+      }
+    } catch (err) {
+      console.error(`[Monthly Sweep] Error for user ${user._id}:`, err.message);
+    }
+  }
+  return queuedCount;
+};
+
+/**
+ * Sweep function to compile weekly smart financial tips for all users.
+ */
+export const runFinancialTipsSweep = async () => {
+  const users = await User.find({ whatsappNumber: { $exists: true, $ne: '' } });
+  let queuedCount = 0;
+
+  for (const user of users) {
+    try {
+      const userPrefs = user.notificationSettings || {};
+      if (userPrefs.financialTips === false) continue;
+
+      const userLoans = await Loan.find({ userId: user._id, status: 'active' });
+      if (userLoans.length === 0) continue;
+
+      const highestInterestLoan = userLoans.reduce((prev, current) => {
+        return (prev.interestRate > current.interestRate) ? prev : current;
+      });
+
+      const extraPayment = 500;
+      const potentialMonthsSaved = Math.min(12, Math.round(highestInterestLoan.outstandingBalance / (highestInterestLoan.emiAmount * 10)));
+      
+      const currentRate = highestInterestLoan.interestRate;
+      let savingsText = '';
+      if (currentRate > 10) {
+        const potentialSavings = Math.round(highestInterestLoan.outstandingBalance * (currentRate - 8.5) * 0.01);
+        savingsText = `Refinancing your ${highestInterestLoan.provider} ${highestInterestLoan.loanType} (currently @ ${currentRate}%) to a lower rate could save you around ₹${potentialSavings.toLocaleString('en-IN')} annually!`;
+      } else {
+        savingsText = `Paying ₹${extraPayment} extra monthly on your ${highestInterestLoan.provider} ${highestInterestLoan.loanType} can help you close this loan ${potentialMonthsSaved} months earlier!`;
+      }
+
+      const messageText = replacePlaceholders(WhatsAppTemplates.CREDIT_TIPS, {
+        name: user.name || 'there',
+        insightMessage: savingsText
+      });
+
+      const existing = await NotificationOutbox.findOne({
+        userId: user._id,
+        template: 'CREDIT_TIPS',
+        status: 'pending'
+      });
+
+      if (!existing) {
+        await NotificationOutbox.create({
+          userId: user._id,
+          template: 'CREDIT_TIPS',
+          chatId: user.notificationChannel === 'WhatsApp' ? (user.whatsappNumber || '') : (user.telegramChatId || ''),
+          message: messageText,
+        });
+        queuedCount++;
+      }
+    } catch (err) {
+      console.error(`[Financial Tips Sweep] Error for user ${user._id}:`, err.message);
+    }
+  }
+  return queuedCount;
 };
 
 /**
  * Initializes the background cron scheduler.
  */
 export const initScheduler = () => {
-  // Sweep daily at 9:00 AM: check EMI due tomorrow
+  // 1. Due Tomorrow sweep: daily at 9:00 AM
   cron.schedule('0 9 * * *', async () => {
     console.log('[Scheduler] Running daily 9:00 AM sweep (due tomorrow)...');
     try {
-      const count = await runEmiDueSweep(1);
-      console.log(`[Scheduler] 9 AM sweep processed ${count} reminder(s).`);
+      const count = await runDueTomorrowSweep();
+      console.log(`[Scheduler] Due Tomorrow sweep processed ${count} reminder(s).`);
     } catch (error) {
-      console.error('[Scheduler] 9 AM sweep error:', error.message);
+      console.error('[Scheduler] Due Tomorrow sweep error:', error.message);
     }
   });
 
-  // Sweep daily at 10:00 AM: check EMI due today
-  cron.schedule('0 10 * * *', async () => {
-    console.log('[Scheduler] Running daily 10:00 AM sweep (due today)...');
+  // 2. Due Today sweep: daily at 8:00 AM
+  cron.schedule('0 8 * * *', async () => {
+    console.log('[Scheduler] Running daily 8:00 AM sweep (due today)...');
     try {
-      const count = await runEmiDueSweep(0);
-      console.log(`[Scheduler] 10 AM sweep processed ${count} reminder(s).`);
+      const count = await runDueTodaySweep();
+      console.log(`[Scheduler] Due Today sweep processed ${count} reminder(s).`);
     } catch (error) {
-      console.error('[Scheduler] 10 AM sweep error:', error.message);
+      console.error('[Scheduler] Due Today sweep error:', error.message);
+    }
+  });
+
+  // 3. Overdue sweep: daily at 10:00 AM
+  cron.schedule('0 10 * * *', async () => {
+    console.log('[Scheduler] Running daily 10:00 AM sweep (overdue)...');
+    try {
+      const count = await runOverdueSweep();
+      console.log(`[Scheduler] Overdue sweep processed ${count} alert(s).`);
+    } catch (error) {
+      console.error('[Scheduler] Overdue sweep error:', error.message);
+    }
+  });
+
+  // 4. Monthly loan summary: monthly on the 1st day at 9:30 AM
+  cron.schedule('30 9 1 * *', async () => {
+    console.log('[Scheduler] Running monthly summary sweep...');
+    try {
+      const count = await runMonthlySummarySweep();
+      console.log(`[Scheduler] Monthly summary sweep queued for ${count} user(s).`);
+    } catch (error) {
+      console.error('[Scheduler] Monthly summary sweep error:', error.message);
+    }
+  });
+
+  // 5. Weekly financial tips sweep: weekly on Monday at 9:00 AM
+  cron.schedule('0 9 * * 1', async () => {
+    console.log('[Scheduler] Running weekly financial tips sweep...');
+    try {
+      const count = await runFinancialTipsSweep();
+      console.log(`[Scheduler] Weekly financial tips sweep queued for ${count} user(s).`);
+    } catch (error) {
+      console.error('[Scheduler] Weekly financial tips sweep error:', error.message);
     }
   });
 
@@ -140,17 +411,6 @@ export const initScheduler = () => {
     }
   });
 
-  // Monthly WhatsApp Financial Summary Automation — fires on the 1st of each month at 9:00 AM
-  cron.schedule('0 9 1 * *', async () => {
-    console.log('[Scheduler] Running monthly WhatsApp summaries automation...');
-    try {
-      const count = await dispatchMonthlyWhatsAppSummaries();
-      console.log(`[Scheduler] Monthly WhatsApp summaries queued for ${count} user(s).`);
-    } catch (error) {
-      console.error('[Scheduler] Monthly WhatsApp summaries error:', error.message);
-    }
-  });
-
   // GDPR Data Retention Purge: Runs every Sunday at midnight
   cron.schedule('0 0 * * 0', async () => {
     console.log('[Scheduler] Running scheduled GDPR data retention sweep...');
@@ -162,77 +422,6 @@ export const initScheduler = () => {
   });
 
   console.log('[Scheduler] Background cron scheduler registered successfully.');
-};
-
-
-/**
- * Sweeps active loans, generates due alert messages, and queues them in the Outbox.
- * Alerts are scheduled if a loan is due today or in exactly 3 days.
- * 
- * @returns {Promise<number>} - Number of notifications queued
- */
-const checkAndQueueLoans = async () => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  const loans = await Loan.find({ status: 'active' }).populate('userId');
-  let queuedCount = 0;
-
-  for (const loan of loans) {
-    if (!loan.userId || !loan.userId.telegramChatId) {
-      continue;
-    }
-
-    const dueDate = new Date(loan.nextDueDate);
-    dueDate.setHours(0, 0, 0, 0);
-
-    const diffTime = dueDate.getTime() - today.getTime();
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-
-    // Send notifications if the loan is due today (0 days) or in exactly 3 days
-    if (diffDays === 0 || diffDays === 3) {
-      const geo = loan.userId && typeof loan.userId === 'object' ? loan.userId.geo : 'IN';
-      const { symbol, locale } = getGeoFormatting(geo);
-
-      const dueDateStr = new Date(loan.nextDueDate).toLocaleDateString(locale, {
-        day: 'numeric',
-        month: 'long',
-        year: 'numeric',
-      });
-
-      const message = `🔔 <b>EMI Due Reminder</b>
-
-Hello! This is a reminder regarding your upcoming EMI payment:
-
-🏛️ <b>Provider:</b> ${loan.provider}
-📋 <b>Loan Type:</b> ${loan.loanType}
-💰 <b>EMI Amount:</b> ${symbol}${loan.emiAmount.toLocaleString(locale)}
-📅 <b>Due Date:</b> ${dueDateStr}
-⌛ <b>Time Left:</b> ${diffDays === 0 ? 'Due Today!' : `In ${diffDays} day(s)`}
-
-<i>Please ensure your account has sufficient funds for the auto-debit transfer.</i>`;
-
-      // Check if this exact alert is already queued/pending to prevent duplicates
-      const existing = await NotificationOutbox.findOne({
-        userId: loan.userId._id,
-        loanId: loan._id,
-        status: 'pending',
-        message: message,
-      });
-
-      if (!existing) {
-        await NotificationOutbox.create({
-          userId: loan.userId._id,
-          loanId: loan._id,
-          chatId: loan.userId.telegramChatId,
-          message: message,
-        });
-        queuedCount++;
-      }
-    }
-  }
-
-  return queuedCount;
 };
 
 import { sendWhatsAppMessage } from './whatsappService.js';
@@ -265,6 +454,7 @@ export const dispatchOutboxQueue = async () => {
           .replace(/<[^>]*>/g, ''); // Strip HTML tags for clean WhatsApp text formatting
         const waResult = await sendWhatsAppMessage(waNumber, cleanMsg);
         success = waResult.success;
+        if (!success) dispatchError = waResult.error;
       } catch (err) {
         dispatchError = err.message;
       }
@@ -286,6 +476,19 @@ export const dispatchOutboxQueue = async () => {
     }
 
     await notification.save();
+
+    // Log the event to NotificationLog for tracking & analytics
+    await NotificationLog.create({
+      userId: user ? user._id : notification.userId,
+      phone: (user && user.notificationChannel === 'WhatsApp' ? user.whatsappNumber : user?.telegramChatId) || notification.chatId || '0000000000',
+      template: notification.template || 'OUTBOX_NOTIFICATION',
+      message: notification.message,
+      loanId: notification.loanId || null,
+      status: success ? 'delivered' : 'failed',
+      sentAt: notification.createdAt,
+      deliveredAt: success ? new Date() : null,
+      failedReason: success ? null : (dispatchError || 'Unknown dispatch error.'),
+    });
   }
 
   return sentCount;
@@ -298,69 +501,17 @@ export const dispatchOutboxQueue = async () => {
  * @returns {Promise<number>} - Number of notifications successfully processed
  */
 export const runManualSweep = async () => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  console.log('[Manual Sweep] Running manual sweeps...');
+  let totalQueued = 0;
+  totalQueued += await runDueTomorrowSweep();
+  totalQueued += await runDueTodaySweep();
+  totalQueued += await runOverdueSweep();
 
-  const loans = await Loan.find({ status: 'active' }).populate('userId');
-  let queuedCount = 0;
-
-  for (const loan of loans) {
-    if (!loan.userId || !loan.userId.telegramChatId) continue;
-
-    const dueDate = new Date(loan.nextDueDate);
-    dueDate.setHours(0, 0, 0, 0);
-
-    const diffTime = dueDate.getTime() - today.getTime();
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-
-    // Queue anything due in the next 7 days for manual test sweeps
-    if (diffDays >= 0 && diffDays <= 7) {
-      const geo = loan.userId && typeof loan.userId === 'object' ? loan.userId.geo : 'IN';
-      const { symbol, locale } = getGeoFormatting(geo);
-
-      const dueDateStr = new Date(loan.nextDueDate).toLocaleDateString(locale, {
-        day: 'numeric',
-        month: 'long',
-        year: 'numeric',
-      });
-
-      const message = `🔔 <b>EMI Due Reminder (Test Sweep)</b>
-
-Hello! This is a manual test reminder regarding your upcoming EMI payment:
-
-🏛️ <b>Provider:</b> ${loan.provider}
-📋 <b>Loan Type:</b> ${loan.loanType}
-💰 <b>EMI Amount:</b> ${symbol}${loan.emiAmount.toLocaleString(locale)}
-📅 <b>Due Date:</b> ${dueDateStr}
-⌛ <b>Time Left:</b> ${diffDays === 0 ? 'Due Today!' : `In ${diffDays} day(s)`}
-
-<i>Please ensure your account has sufficient funds for the auto-debit transfer.</i>`;
-
-      const existing = await NotificationOutbox.findOne({
-        userId: loan.userId._id,
-        loanId: loan._id,
-        status: 'pending',
-        message: message,
-      });
-
-      if (!existing) {
-        await NotificationOutbox.create({
-          userId: loan.userId._id,
-          loanId: loan._id,
-          chatId: loan.userId.telegramChatId,
-          message: message,
-        });
-        queuedCount++;
-      }
-    }
-  }
-
-  // Immediately invoke dispatch sweep if new alerts were queued
-  if (queuedCount > 0) {
+  if (totalQueued > 0) {
     await dispatchOutboxQueue();
   }
 
-  return queuedCount;
+  return totalQueued;
 };
 
 /**

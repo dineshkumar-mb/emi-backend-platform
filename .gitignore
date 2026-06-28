@@ -1,17 +1,13 @@
 # Dependencies
 node_modules/
-
 # Production builds
 dist/
 build/
-
 # Environment files
 .env
 .env.local
-
 # Testing / Coverage
 coverage/
-
 # IDEs and Editors
 .vscode/
 .idea/
@@ -20,12 +16,16 @@ coverage/
 *.njsproj
 *.sln
 *.sw?
-
 # OS files
 .DS_Store
 Thumbs.db
-
 # Backend specific ignores
 logs/
 uploads/
 tmp/
+
+# managed
+**.data.json
+**.node-persist**
+**_IGNORE_**
+# end managed

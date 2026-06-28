@@ -2,6 +2,7 @@ import Loan from '../models/Loan.js';
 import ParsedSms from '../models/ParsedSms.js';
 import LoanPayment from '../models/LoanPayment.js';
 import NotificationLog from '../models/NotificationLog.js';
+import { WhatsAppTemplates, replacePlaceholders } from '../templates/whatsappTemplates.js';
 import { calculateEMI, forecastPrepayment } from '../services/emiEngine.js';
 import { detectTransactionEMI, getProcessingAction } from '../services/emiDetectionService.js';
 import { findMatchingLoan } from '../services/loanMatchingService.js';
@@ -141,8 +142,9 @@ export const markPaid = async (req, res) => {
       }
     }
 
-    // Reduce outstanding balance by payment amount (floor at 0)
-    loan.outstandingBalance = Math.max(0, loan.outstandingBalance - paymentAmount);
+    // Deduct interest portion and reduce outstanding balance by principal portion
+    const breakdown = calculateEmiBreakdown(loan.outstandingBalance, loan.interestRate, paymentAmount);
+    loan.outstandingBalance = breakdown.outstandingBalance;
 
     // Roll next due date forward by exactly 1 month
     const currentDue = new Date(loan.nextDueDate);
@@ -163,6 +165,21 @@ export const markPaid = async (req, res) => {
     });
 
     const updatedLoan = await loan.save();
+
+    // Create LoanPayment document to keep stats and transaction log in sync
+    await LoanPayment.create({
+      loanId: loan._id,
+      paymentDate: date ? new Date(date) : new Date(),
+      emiNumber: loan.paymentHistory.length,
+      emiAmount: paymentAmount,
+      principalPaid: breakdown.principalPaid,
+      interestPaid: breakdown.interestPaid,
+      outstandingBalance: breakdown.outstandingBalance,
+      paymentStatus: 'success',
+      source: source || 'Manual',
+      transactionId: refId || null,
+    });
+
     res.json({
       message: 'Payment recorded successfully.',
       loan: updatedLoan,
@@ -347,52 +364,63 @@ export const recordPayment = async (req, res) => {
     const aiInsight = await generateLoanInsights(loan);
 
     // Queue WhatsApp success notifications
-    if (req.user.whatsappNumber) {
-      const formattedDate = new Date(loan.nextDueDate).toLocaleDateString('en-GB', {
-        day: '2-digit',
-        month: 'short',
-        year: 'numeric',
-      }).replace(/ /g, '-');
+    const userPrefs = req.user.notificationSettings || {};
+    const isPaymentAlertEnabled = userPrefs.paymentAlerts !== false;
 
-      const template1Text = `✅ *EMI Payment Successful*\n\n*Loan*:\n${loan.provider} ${loan.loanType}\n\n*EMI Amount*:\n₹${paymentAmount.toLocaleString('en-IN')}\n\n*Principal Paid*:\n₹${breakdown.principalPaid.toLocaleString('en-IN')}\n\n*Interest Paid*:\n₹${breakdown.interestPaid.toLocaleString('en-IN')}\n\n*Outstanding Balance*:\n₹${breakdown.outstandingBalance.toLocaleString('en-IN')}\n\n*Next EMI*:\n${formattedDate}`;
+    if (isPaymentAlertEnabled && req.user.whatsappNumber) {
+      const loanName = `${loan.provider} ${loan.loanType}`;
       
-      const countdown = calculateDebtCountdown(loan);
-      
-      const totalPaymentsSum = await LoanPayment.aggregate([
-        { $match: { loanId: loan._id } },
-        { $group: { _id: null, totalPrincipal: { $sum: '$principalPaid' }, totalInterest: { $sum: '$interestPaid' } } }
-      ]);
-      const totalPrincipalPaidActual = (totalPaymentsSum[0]?.totalPrincipal || 0) + breakdown.principalPaid;
-      const totalInterestPaidActual = (totalPaymentsSum[0]?.totalInterest || 0) + breakdown.interestPaid;
-
-      const totalEmis = loan.tenure || 60;
-      const remainingEmis = Math.max(0, totalEmis - emiNumber);
-
-      const template2Text = `🎯 *Loan Progress Update*\n\n*EMI Number*:\n${emiNumber} / ${totalEmis}\n\n*Principal Paid Till Date*:\n₹${totalPrincipalPaidActual.toLocaleString('en-IN')}\n\n*Interest Paid Till Date*:\n₹${totalInterestPaidActual.toLocaleString('en-IN')}\n\n*Remaining EMIs*:\n${remainingEmis}\n\n*Debt-Free Date*:\n${countdown.estimatedClosureText}`;
-
-      await queueWhatsAppMessage({
-        userId: req.user._id,
-        to: req.user.whatsappNumber,
-        type: 'message',
-        message: template1Text,
-        loanId: loan._id,
+      // 1. Send EMI Paid Alert
+      const emiPaidText = replacePlaceholders(WhatsAppTemplates.EMI_PAID, {
+        name: req.user.name || 'Customer',
+        emiAmount: paymentAmount.toLocaleString('en-IN'),
+        loanName,
+        paymentDate: (date ? new Date(date) : new Date()).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }),
+        remainingBalance: loan.outstandingBalance.toLocaleString('en-IN')
       });
 
       await queueWhatsAppMessage({
         userId: req.user._id,
         to: req.user.whatsappNumber,
         type: 'message',
-        message: template2Text,
+        message: emiPaidText,
+        templateName: 'EMI_PAID',
         loanId: loan._id,
       });
 
-      await queueWhatsAppMessage({
-        userId: req.user._id,
-        to: req.user.whatsappNumber,
-        type: 'message',
-        message: aiInsight,
-        loanId: loan._id,
-      });
+      // 2. If loan is closed, send Loan Closed Alert
+      if (loan.outstandingBalance === 0 && loan.status === 'completed') {
+        // Calculate total amount paid from history or principal
+        const totalPaidVal = loan.principal || paymentAmount;
+        
+        const loanClosedText = replacePlaceholders(WhatsAppTemplates.LOAN_CLOSED, {
+          loanName,
+          totalPaid: totalPaidVal.toLocaleString('en-IN'),
+          closureDate: new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+        });
+
+        await queueWhatsAppMessage({
+          userId: req.user._id,
+          to: req.user.whatsappNumber,
+          type: 'message',
+          message: loanClosedText,
+          templateName: 'LOAN_CLOSED',
+          loanId: loan._id,
+        });
+      }
+
+      // Also send the AI Insight if enabled (as financial tips or generic)
+      const isFinancialTipsEnabled = userPrefs.financialTips === true;
+      if (isFinancialTipsEnabled && aiInsight) {
+        await queueWhatsAppMessage({
+          userId: req.user._id,
+          to: req.user.whatsappNumber,
+          type: 'message',
+          message: aiInsight,
+          templateName: 'FINANCIAL_TIPS',
+          loanId: loan._id,
+        });
+      }
     }
 
     res.status(201).json({
@@ -560,52 +588,63 @@ export const detectAndProcessTransaction = async (req, res) => {
 
     const aiInsight = await generateLoanInsights(loan);
 
-    if (req.user.whatsappNumber) {
-      const formattedDate = new Date(loan.nextDueDate).toLocaleDateString('en-GB', {
-        day: '2-digit',
-        month: 'short',
-        year: 'numeric',
-      }).replace(/ /g, '-');
+    // Queue WhatsApp success notifications
+    const userPrefs = req.user.notificationSettings || {};
+    const isPaymentAlertEnabled = userPrefs.paymentAlerts !== false;
 
-      const template1Text = `✅ *EMI Payment Successful*\n\n*Loan*:\n${loan.provider} ${loan.loanType}\n\n*EMI Amount*:\n₹${paymentAmount.toLocaleString('en-IN')}\n\n*Principal Paid*:\n₹${breakdown.principalPaid.toLocaleString('en-IN')}\n\n*Interest Paid*:\n₹${breakdown.interestPaid.toLocaleString('en-IN')}\n\n*Outstanding Balance*:\n₹${breakdown.outstandingBalance.toLocaleString('en-IN')}\n\n*Next EMI*:\n${formattedDate}`;
+    if (isPaymentAlertEnabled && req.user.whatsappNumber) {
+      const loanName = `${loan.provider} ${loan.loanType}`;
       
-      const countdown = calculateDebtCountdown(loan);
-      
-      const totalPaymentsSum = await LoanPayment.aggregate([
-        { $match: { loanId: loan._id } },
-        { $group: { _id: null, totalPrincipal: { $sum: '$principalPaid' }, totalInterest: { $sum: '$interestPaid' } } }
-      ]);
-      const totalPrincipalPaidActual = (totalPaymentsSum[0]?.totalPrincipal || 0) + breakdown.principalPaid;
-      const totalInterestPaidActual = (totalPaymentsSum[0]?.totalInterest || 0) + breakdown.interestPaid;
-
-      const totalEmis = loan.tenure || 60;
-      const remainingEmis = Math.max(0, totalEmis - emiNumber);
-
-      const template2Text = `🎯 *Loan Progress Update*\n\n*EMI Number*:\n${emiNumber} / ${totalEmis}\n\n*Principal Paid Till Date*:\n₹${totalPrincipalPaidActual.toLocaleString('en-IN')}\n\n*Interest Paid Till Date*:\n₹${totalInterestPaidActual.toLocaleString('en-IN')}\n\n*Remaining EMIs*:\n${remainingEmis}\n\n*Debt-Free Date*:\n${countdown.estimatedClosureText}`;
-
-      await queueWhatsAppMessage({
-        userId: req.user._id,
-        to: req.user.whatsappNumber,
-        type: 'message',
-        message: template1Text,
-        loanId: loan._id,
+      // 1. Send EMI Paid Alert
+      const emiPaidText = replacePlaceholders(WhatsAppTemplates.EMI_PAID, {
+        name: req.user.name || 'Customer',
+        emiAmount: paymentAmount.toLocaleString('en-IN'),
+        loanName,
+        paymentDate: new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }),
+        remainingBalance: loan.outstandingBalance.toLocaleString('en-IN')
       });
 
       await queueWhatsAppMessage({
         userId: req.user._id,
         to: req.user.whatsappNumber,
         type: 'message',
-        message: template2Text,
+        message: emiPaidText,
+        templateName: 'EMI_PAID',
         loanId: loan._id,
       });
 
-      await queueWhatsAppMessage({
-        userId: req.user._id,
-        to: req.user.whatsappNumber,
-        type: 'message',
-        message: aiInsight,
-        loanId: loan._id,
-      });
+      // 2. If loan is closed, send Loan Closed Alert
+      if (loan.outstandingBalance === 0 && loan.status === 'completed') {
+        const totalPaidVal = loan.principal || paymentAmount;
+        
+        const loanClosedText = replacePlaceholders(WhatsAppTemplates.LOAN_CLOSED, {
+          loanName,
+          totalPaid: totalPaidVal.toLocaleString('en-IN'),
+          closureDate: new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+        });
+
+        await queueWhatsAppMessage({
+          userId: req.user._id,
+          to: req.user.whatsappNumber,
+          type: 'message',
+          message: loanClosedText,
+          templateName: 'LOAN_CLOSED',
+          loanId: loan._id,
+        });
+      }
+
+      // Also send the AI Insight if enabled
+      const isFinancialTipsEnabled = userPrefs.financialTips === true;
+      if (isFinancialTipsEnabled && aiInsight) {
+        await queueWhatsAppMessage({
+          userId: req.user._id,
+          to: req.user.whatsappNumber,
+          type: 'message',
+          message: aiInsight,
+          templateName: 'FINANCIAL_TIPS',
+          loanId: loan._id,
+        });
+      }
     }
 
     res.json({
