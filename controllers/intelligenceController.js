@@ -1270,3 +1270,21 @@ export const deleteDocument = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
+
+// @desc    Clear all notification logs (Push, SMS, WhatsApp, Email)
+// @route   DELETE /api/intelligence/notifications
+// @access  Private
+export const clearNotificationCenterLogs = async (req, res) => {
+  const userId = req.user._id;
+  try {
+    await Promise.all([
+      SmsLog.deleteMany({ userId }),
+      WhatsAppLog.deleteMany({ userId }),
+      EmailLog.deleteMany({ userId }),
+      PushNotificationLog.deleteMany({ userId })
+    ]);
+    res.json({ message: 'Recent notifications log cleared successfully.' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};

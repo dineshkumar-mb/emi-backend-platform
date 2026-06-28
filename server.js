@@ -121,6 +121,7 @@ import {
   uploadDocument,
   getDocuments,
   deleteDocument,
+  clearNotificationCenterLogs,
 } from './controllers/intelligenceController.js';
 import {
   getAssets,
@@ -727,6 +728,7 @@ intelligenceRouter.get('/fraud', getFraudAlerts);
 intelligenceRouter.patch('/fraud/:id', resolveFraudAlert);
 intelligenceRouter.post('/scan-text', scanTextForFraud);
 intelligenceRouter.get('/notifications', getNotificationCenterLogs);
+intelligenceRouter.delete('/notifications', clearNotificationCenterLogs);
 intelligenceRouter.post('/documents', uploadLimiter, upload.single('file'), uploadSecurityMiddleware, uploadDocument);
 intelligenceRouter.get('/documents', getDocuments);
 intelligenceRouter.delete('/documents/:id', deleteDocument);
@@ -797,6 +799,15 @@ notificationRouter.get('/logs', async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(100);
     res.json(logs);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+notificationRouter.delete('/logs', async (req, res) => {
+  try {
+    await NotificationLog.deleteMany({ userId: req.user._id });
+    res.json({ message: 'Delivery logs reset successfully.' });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
