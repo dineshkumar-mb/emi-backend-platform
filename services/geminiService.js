@@ -1074,9 +1074,8 @@ Output format:
 
   console.log(`[AdvisorOrchestrator] Query: "${query}". Routed agents:`, routedAgents);
 
-  // 2. Invoke sub-agents
-  const agentOutputs = {};
-  for (const agent of routedAgents) {
+  // 2. Invoke sub-agents in parallel to maximize performance
+  const agentPromises = routedAgents.map(async (agent) => {
     let agentPrompt = '';
     
     if (agent === 'loan') {
@@ -1101,13 +1100,22 @@ Output format:
       try {
         const agentModel = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
         const agentResult = await agentModel.generateContent(agentPrompt);
-        agentOutputs[agent] = agentResult.response.text().trim();
+        return { agent, output: agentResult.response.text().trim() };
       } catch (err) {
         console.error(`[SubAgent ${agent}] Error executing:`, err);
-        agentOutputs[agent] = `Failed to execute agent: ${err.message}`;
+        return { agent, output: `Failed to execute agent: ${err.message}` };
       }
     }
-  }
+    return null;
+  });
+
+  const results = await Promise.all(agentPromises);
+  const agentOutputs = {};
+  results.forEach(r => {
+    if (r) {
+      agentOutputs[r.agent] = r.output;
+    }
+  });
 
   // 3. Aggregate outputs via Orchestration synthesizer
   const synthesizerPrompt = `You are the Orchestration Synthesizer. You have routed the user's query: "${query}" to the following specialized sub-agents:
