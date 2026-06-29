@@ -21,7 +21,8 @@ import { authorize } from './middleware/rbacMiddleware.js';
 import { initOpenWA, getSessionUuid } from './services/openwaClient.js';
 import { WhatsAppTemplates, replacePlaceholders } from './templates/whatsappTemplates.js';
 import { queueWhatsAppMessage } from './services/whatsappAutomationService.js';
-
+import { startScheduler } from './services/scheduler.js';
+import cronRoutes from './routes/cronRoutes.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const swaggerDocument = JSON.parse(
@@ -152,7 +153,7 @@ import { getForecastAnalytics, exportExcelReport } from './controllers/analytics
 import { getHealthStatus } from './controllers/healthController.js';
 
 import { sendTelegramMessage } from './services/telegramService.js';
-import { initScheduler, runManualSweep, dispatchMonthlyPdfReports } from './services/scheduler.js';
+import { runManualSweep, dispatchMonthlyPdfReports } from './services/scheduler.js';
 import { scanTransactionForFraud } from './services/fraudEngine.js';
 import { createFeedback, getFeedback, createCrashReport, createAnalyticsEvent } from './controllers/supportController.js';
 
@@ -183,12 +184,15 @@ if (missingEnv.length > 0) {
 }
 
 // Connect to Database
-connectDB().catch(err => {
+connectDB().then(() => {
+  // Start the background cron scheduler for automated sweeps
+  startScheduler();
+}).catch(err => {
   console.error('⚠️ Database connection failed at startup. Server will run but DB features will fail:', err.message);
 });
 
 // Initialize Daily Cron Scheduler (Notification Outbox Worker)
-initScheduler();
+// (Now handled inside connectDB().then block using startScheduler)
 
 const app = express();
 
@@ -1008,6 +1012,7 @@ supportRouter.post('/analytics', createAnalyticsEvent);
 supportRouter.post('/feedback', protect, validateRequest(feedbackSchema), createFeedback);
 supportRouter.get('/feedback', protect, getFeedback);
 app.use('/api/support', supportRouter);
+app.use('/api/cron', cronRoutes);
 
 // ── App Version Checker Route ─────────────────────────────────────────────────
 app.get('/api/app-version', (req, res) => {

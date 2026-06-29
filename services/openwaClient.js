@@ -13,8 +13,80 @@ let sessionUuid = null; // Stored session UUID resolved from database
 
 export const getSessionUuid = () => sessionUuid;
 
-export const initOpenWA = () => {
-  if (gatewayProcess) return Promise.resolve();
+export const setupDefaultSession = async () => {
+  try {
+    console.log('[OpenWA Client] Registering default WhatsApp session on gateway...');
+    
+    // Create session
+    const createRes = await fetch(`http://localhost:${API_PORT}/api/sessions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': API_KEY
+      },
+      body: JSON.stringify({
+        name: SESSION_NAME // Must use 'name' instead of 'sessionId'
+      })
+    });
+
+    if (createRes.ok) {
+      const sessionData = await createRes.json();
+      sessionUuid = sessionData.id;
+      console.log(`[OpenWA Client] Default session registered. UUID: ${sessionUuid}`);
+    } else if (createRes.status === 409) {
+      // Session already exists, let's fetch its UUID
+      console.log('[OpenWA Client] Session already exists. Fetching UUID...');
+      const listRes = await fetch(`http://localhost:${API_PORT}/api/sessions`, {
+        headers: {
+          'X-API-Key': API_KEY
+        }
+      });
+      if (listRes.ok) {
+        const sessions = await listRes.json();
+        const defaultSess = sessions.find(s => s.name === SESSION_NAME);
+        if (defaultSess) {
+          sessionUuid = defaultSess.id;
+          console.log(`[OpenWA Client] Resolved existing session UUID: ${sessionUuid}`);
+        }
+      }
+    } else {
+      const errBody = await createRes.json().catch(() => ({}));
+      console.error('[OpenWA Client] Failed to create session:', errBody.message || createRes.statusText);
+    }
+
+    if (sessionUuid) {
+      // Start session using its UUID
+      console.log('[OpenWA Client] Connecting default WhatsApp session...');
+      await fetch(`http://localhost:${API_PORT}/api/sessions/${sessionUuid}/start`, {
+        method: 'POST',
+        headers: {
+          'X-API-Key': API_KEY
+        }
+      });
+
+      console.log('[OpenWA Client] OpenWA Gateway started successfully! Link at http://localhost:5000/api/loans/whatsapp-qr');
+    } else {
+      console.error('[OpenWA Client] Could not resolve session UUID. Start aborted.');
+    }
+  } catch (err) {
+    console.error('[OpenWA Client] Failed to register/start session:', err.message);
+  }
+};
+
+export const initOpenWA = async () => {
+  if (gatewayProcess || sessionUuid) return Promise.resolve();
+
+  // 1. Check if it's already running in the background (e.g., from server.js)
+  try {
+    const healthRes = await fetch(`http://localhost:${API_PORT}/api/health/ready`);
+    if (healthRes.ok) {
+      console.log('[OpenWA Client] Gateway is already running in another process.');
+      await setupDefaultSession();
+      return;
+    }
+  } catch (err) {
+    // If fetch fails (ECONNREFUSED), it means it's not running. Proceed to spawn.
+  }
 
   return new Promise((resolve, reject) => {
     console.log('[OpenWA Client] Starting standalone OpenWA API Gateway (Baileys socket engine)...');
@@ -57,65 +129,8 @@ export const initOpenWA = () => {
         
         // Wait 3 seconds for services to settle, then initialize default session
         setTimeout(async () => {
-          try {
-            console.log('[OpenWA Client] Registering default WhatsApp session on gateway...');
-            
-            // Create session
-            const createRes = await fetch(`http://localhost:${API_PORT}/api/sessions`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': API_KEY
-              },
-              body: JSON.stringify({
-                name: SESSION_NAME // Must use 'name' instead of 'sessionId'
-              })
-            });
-
-            if (createRes.ok) {
-              const sessionData = await createRes.json();
-              sessionUuid = sessionData.id;
-              console.log(`[OpenWA Client] Default session registered. UUID: ${sessionUuid}`);
-            } else if (createRes.status === 409) {
-              // Session already exists, let's fetch its UUID
-              console.log('[OpenWA Client] Session already exists. Fetching UUID...');
-              const listRes = await fetch(`http://localhost:${API_PORT}/api/sessions`, {
-                headers: {
-                  'X-API-Key': API_KEY
-                }
-              });
-              if (listRes.ok) {
-                const sessions = await listRes.json();
-                const defaultSess = sessions.find(s => s.name === SESSION_NAME);
-                if (defaultSess) {
-                  sessionUuid = defaultSess.id;
-                  console.log(`[OpenWA Client] Resolved existing session UUID: ${sessionUuid}`);
-                }
-              }
-            } else {
-              const errBody = await createRes.json().catch(() => ({}));
-              console.error('[OpenWA Client] Failed to create session:', errBody.message || createRes.statusText);
-            }
-
-            if (sessionUuid) {
-              // Start session using its UUID
-              console.log('[OpenWA Client] Connecting default WhatsApp session...');
-              await fetch(`http://localhost:${API_PORT}/api/sessions/${sessionUuid}/start`, {
-                method: 'POST',
-                headers: {
-                  'X-API-Key': API_KEY
-                }
-              });
-
-              console.log('[OpenWA Client] OpenWA Gateway started successfully! Link at http://localhost:5173/api/loans/whatsapp-qr');
-            } else {
-              console.error('[OpenWA Client] Could not resolve session UUID. Start aborted.');
-            }
-            resolve();
-          } catch (err) {
-            console.error('[OpenWA Client] Failed to register/start session:', err.message);
-            resolve(); // Still resolve so backend startup isn't blocked
-          }
+          await setupDefaultSession();
+          resolve();
         }, 3000);
       }
     });
@@ -135,7 +150,10 @@ export const initOpenWA = () => {
     gatewayProcess.on('exit', (code) => {
       console.log(`[OpenWA Client] Gateway subprocess exited with code ${code}`);
       gatewayProcess = null;
-      sessionUuid = null;
+      if (!resolved) {
+        resolved = true;
+        resolve(); // resolve so we don't hang if it crashes during init
+      }
     });
   });
 };

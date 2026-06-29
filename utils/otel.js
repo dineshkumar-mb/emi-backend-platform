@@ -23,17 +23,17 @@ const sdk = new NodeSDK({
 
 // Start SDK and register lifecycle handlers
 try {
-  sdk.start();
-  console.log('🔭 OpenTelemetry initialized with Console Exporter. Tracing active.');
+  // sdk.start();
+  console.log('🔭 OpenTelemetry initialized with Console Exporter (DISABLED to prevent crashes).');
 } catch (error) {
   console.error('❌ Failed to initialize OpenTelemetry:', error);
 }
 
-process.on('SIGTERM', () => {
-  sdk.shutdown()
-    .then(() => console.log('🔭 OpenTelemetry tracing terminated.'))
-    .catch((error) => console.error('❌ Error terminating OpenTelemetry:', error))
-    .finally(() => process.exit(0));
-});
+// process.on('SIGTERM', () => {
+//   sdk.shutdown()
+//     .then(() => console.log('🔭 OpenTelemetry tracing terminated.'))
+//     .catch((error) => console.error('❌ Error terminating OpenTelemetry:', error))
+//     .finally(() => process.exit(0));
+// });
 
 export default sdk;

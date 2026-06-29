@@ -488,6 +488,21 @@ export const detectAndProcessTransaction = async (req, res) => {
     const result = await detectTransactionEMI(text);
     const action = getProcessingAction(result.confidence);
 
+    let balanceUpdated = false;
+    if (result.availableBalance !== null && !isNaN(result.availableBalance)) {
+      req.user.currentBalance = result.availableBalance;
+      await req.user.save();
+      balanceUpdated = true;
+    }
+
+    if (!result.isEMI) {
+      return res.json({
+        status: balanceUpdated ? 'balance_updated' : 'ignored',
+        message: balanceUpdated ? 'Transaction parsed. Balance updated.' : 'Not an EMI transaction.',
+        parsed: result,
+      });
+    }
+
     if (action === 'ignore') {
       return res.json({
         status: 'ignored',

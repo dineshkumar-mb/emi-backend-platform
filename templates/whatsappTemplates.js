@@ -12,6 +12,30 @@ export const replacePlaceholders = (templateText, data) => {
 };
 
 export const WhatsAppTemplates = {
+  DUE_IN_3_DAYS: `⏰ *Upcoming EMI*
+
+Hi {{name}}
+
+Your EMI of ₹{{emiAmount}}
+
+for:
+
+{{loanName}}
+
+will be due in 3 days on {{dueDate}}.
+
+Please ensure your account is funded.`,
+
+  LOW_BALANCE_ALERT: `⚠️ *Low Balance Alert*
+
+Hi {{name}}
+
+Your EMI of ₹{{emiAmount}} is due soon, but your predicted account balance is only ₹{{currentBalance}}.
+
+Expected Shortfall: ₹{{shortfall}}
+
+Please deposit funds immediately to avoid bounce penalties.`,
+
   EMI_DUE_TOMORROW: `⏰ *EMI Reminder*
 
 Hi {{name}}

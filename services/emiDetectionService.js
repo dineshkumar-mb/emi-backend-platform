@@ -1,11 +1,13 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
-const SYSTEM_PROMPT = `You are a financial transaction analyzer. Analyze the provided message (SMS, notification, or alert) and detect if it represents an EMI payment, loan payment, or repayment.
+const SYSTEM_PROMPT = `You are a financial transaction analyzer. Analyze the provided message (SMS, notification, or alert) and detect if it represents an EMI payment, loan payment, or repayment, or a general transaction.
 
 Extract the following details:
 - isEMI: true if the message is an EMI or loan payment/debit. Otherwise false.
+- transactionType: Classify as one of "EMI_DEBIT", "SALARY_CREDIT", "LOAN_DISBURSED", "GENERAL_DEBIT", "GENERAL_CREDIT".
 - provider: The bank or lending institution name (e.g. HDFC, SBI, ICICI, Bajaj).
-- amount: The numerical amount paid.
+- amount: The numerical amount paid or credited.
+- availableBalance: The numerical available balance after the transaction (if present in the SMS).
 - loanType: One of "Personal Loan", "Home Loan", "Vehicle Loan", "Education Loan", "Credit Card EMI", "BNPL", "Gold Loan", "Business Loan", or "Other".
 - referenceId: The transaction reference ID or UTR number if present (e.g. UPI transaction ID, bank reference number).
 - confidence: A score between 0.0 and 1.0 indicating your confidence in the extraction.
@@ -15,8 +17,10 @@ Return ONLY a valid JSON object matching the schema below. Do not include any ma
 Schema:
 {
   "isEMI": boolean,
+  "transactionType": string | null,
   "provider": string | null,
   "amount": number | null,
+  "availableBalance": number | null,
   "loanType": string | null,
   "referenceId": string | null,
   "confidence": number
@@ -36,8 +40,10 @@ export const detectTransactionEMI = async (text) => {
   if (!text || text.trim().length < 8) {
     return {
       isEMI: false,
+      transactionType: null,
       provider: null,
       amount: null,
+      availableBalance: null,
       loanType: null,
       referenceId: null,
       confidence: 0.0,
@@ -65,8 +71,10 @@ export const detectTransactionEMI = async (text) => {
 
     return {
       isEMI: !!data.isEMI,
+      transactionType: data.transactionType || null,
       provider: data.provider || null,
       amount: Number(data.amount) || null,
+      availableBalance: Number(data.availableBalance) || null,
       loanType: data.loanType || null,
       referenceId: data.referenceId || null,
       confidence: conf,
@@ -76,8 +84,10 @@ export const detectTransactionEMI = async (text) => {
     // Graceful fallback for offline/errors
     return {
       isEMI: text.toLowerCase().includes('emi') || text.toLowerCase().includes('loan'),
+      transactionType: text.toLowerCase().includes('debited') ? 'GENERAL_DEBIT' : 'GENERAL_CREDIT',
       provider: null,
       amount: null,
+      availableBalance: null,
       loanType: null,
       referenceId: null,
       confidence: 0.5, // low confidence on error fallback

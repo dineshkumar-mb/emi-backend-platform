@@ -21,6 +21,9 @@ import { calculateCreditScore } from './creditEngine.js';
 import { queueWhatsAppMessage } from './whatsappAutomationService.js';
 import NotificationLog from '../models/NotificationLog.js';
 import { WhatsAppTemplates, replacePlaceholders } from '../templates/whatsappTemplates.js';
+import { getQueue } from '../utils/queueManager.js';
+import { buildDueTomorrowPipeline, buildDueTodayPipeline, buildOverduePipeline, buildDueIn3DaysPipeline } from './aggregations/loanNotificationPipelines.js';
+
 
 const getGeoFormatting = (geo) => {
   switch (geo) {
@@ -35,176 +38,122 @@ const getGeoFormatting = (geo) => {
 };
 
 /**
- * Sweep function to find active loans due tomorrow and dispatch reminders.
+ * Generic sweep runner.
+ * Runs an aggregation pipeline, inserts Outbox records in bulk,
+ * then enqueues each record to BullMQ for parallel dispatch.
+ *
+ * @param {string}   sweepName  - Label for logs
+ * @param {Array}    pipeline   - MongoDB aggregation pipeline
+ * @param {string}   template   - WhatsApp template name (passed to worker)
  */
+async function runSweep(sweepName, pipeline, template) {
+  const startTime = Date.now();
+  console.log(`[Scheduler] Starting sweep: ${sweepName}`);
+
+  try {
+    // 1. Run DB-side aggregation — only matching loans returned
+    const loans = await Loan.aggregate(pipeline);
+
+    if (!loans.length) {
+      console.log(`[Scheduler] ${sweepName}: 0 loans matched. Skipping.`);
+      return 0;
+    }
+
+    console.log(`[Scheduler] ${sweepName}: ${loans.length} loans matched.`);
+
+    // 2. Deduplicate — skip loans already in Outbox for today
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const existingOutbox = await NotificationOutbox.distinct('loanId', {
+      notificationType: template,
+      createdAt: { $gte: today }
+    });
+    const existingSet = new Set(existingOutbox.map(id => id.toString()));
+    const newLoans = loans.filter(l => !existingSet.has(l.loanId.toString()));
+
+    if (!newLoans.length) {
+      console.log(`[Scheduler] ${sweepName}: All loans already in outbox today. Skipping.`);
+      return 0;
+    }
+
+    // 3. Bulk insert into Outbox
+    const outboxDocs = newLoans.map(loan => ({
+      loanId: loan.loanId,
+      userId: loan.userId,
+      phone: loan.phone,
+      notificationType: loan.notificationType,
+      payload: loan,          // full context for the AI agent and template selector
+      status: 'PENDING',
+      createdAt: new Date()
+    }));
+
+    const inserted = await NotificationOutbox.insertMany(outboxDocs, { ordered: false });
+    console.log(`[Scheduler] ${sweepName}: Inserted ${inserted.length} outbox records.`);
+
+    // 4. Enqueue each record to BullMQ (non-blocking — workers handle concurrency)
+    const notificationsQueue = getQueue('notifications');
+    const jobs = inserted.map(doc => ({
+      name: 'whatsapp-notification',
+      data: {
+        outboxId: doc._id.toString(),
+        template,
+        payload: doc.payload
+      },
+      opts: {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 5000 },
+        removeOnComplete: 100,
+        removeOnFail: 200
+      }
+    }));
+
+    await notificationsQueue.addBulk(jobs);
+    console.log(`[Scheduler] ${sweepName}: Enqueued ${jobs.length} jobs to BullMQ.`);
+    return inserted.length;
+
+  } catch (error) {
+    console.error(`[Scheduler] ${sweepName} failed:`, error);
+    return 0;
+  } finally {
+    const elapsed = Date.now() - startTime;
+    console.log(`[Scheduler] ${sweepName} completed in ${elapsed}ms`);
+  }
+}
+
+// ─── PUBLIC SWEEP FUNCTIONS (called by cron) ──────────────────────────────────
+
 export const runDueTomorrowSweep = async () => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  const loans = await Loan.find({ status: 'active' }).populate('userId');
-  let queuedCount = 0;
-
-  for (const loan of loans) {
-    if (!loan.userId) continue;
-    const user = loan.userId;
-
-    const userPrefs = user.notificationSettings || {};
-    if (userPrefs.emiReminders === false) continue;
-
-    const dueDate = new Date(loan.nextDueDate);
-    dueDate.setHours(0, 0, 0, 0);
-
-    const diffTime = dueDate.getTime() - today.getTime();
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-
-    if (diffDays === 1) { // Tomorrow
-      const geo = user.geo || 'IN';
-      const { symbol, locale } = getGeoFormatting(geo);
-      const dueDateStr = dueDate.toLocaleDateString(locale, {
-        day: 'numeric',
-        month: 'long',
-        year: 'numeric'
-      });
-
-      const messageText = replacePlaceholders(WhatsAppTemplates.EMI_DUE_TOMORROW, {
-        name: user.name || 'Customer',
-        emiAmount: loan.emiAmount.toLocaleString(locale),
-        loanName: `${loan.provider} ${loan.loanType}`,
-        dueDate: dueDateStr
-      });
-
-      const existing = await NotificationOutbox.findOne({
-        userId: user._id,
-        loanId: loan._id,
-        template: 'EMI_DUE_TOMORROW',
-        status: 'pending'
-      });
-
-      if (!existing) {
-        await NotificationOutbox.create({
-          userId: user._id,
-          loanId: loan._id,
-          template: 'EMI_DUE_TOMORROW',
-          chatId: user.notificationChannel === 'WhatsApp' ? (user.whatsappNumber || '') : (user.telegramChatId || ''),
-          message: messageText,
-        });
-        queuedCount++;
-      }
-    }
-  }
-  return queuedCount;
+  return await runSweep(
+    'DueTomorrowSweep',
+    buildDueTomorrowPipeline(),
+    'DUE_TOMORROW'
+  );
 };
 
-/**
- * Sweep function to find active loans due today and dispatch reminders.
- */
 export const runDueTodaySweep = async () => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  const loans = await Loan.find({ status: 'active' }).populate('userId');
-  let queuedCount = 0;
-
-  for (const loan of loans) {
-    if (!loan.userId) continue;
-    const user = loan.userId;
-
-    const userPrefs = user.notificationSettings || {};
-    if (userPrefs.emiReminders === false) continue;
-
-    const dueDate = new Date(loan.nextDueDate);
-    dueDate.setHours(0, 0, 0, 0);
-
-    const diffTime = dueDate.getTime() - today.getTime();
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-
-    if (diffDays === 0) { // Today
-      const geo = user.geo || 'IN';
-      const { symbol, locale } = getGeoFormatting(geo);
-
-      const messageText = replacePlaceholders(WhatsAppTemplates.EMI_DUE_TODAY, {
-        emiAmount: loan.emiAmount.toLocaleString(locale),
-        loanName: `${loan.provider} ${loan.loanType}`
-      });
-
-      const existing = await NotificationOutbox.findOne({
-        userId: user._id,
-        loanId: loan._id,
-        template: 'EMI_DUE_TODAY',
-        status: 'pending'
-      });
-
-      if (!existing) {
-        await NotificationOutbox.create({
-          userId: user._id,
-          loanId: loan._id,
-          template: 'EMI_DUE_TODAY',
-          chatId: user.notificationChannel === 'WhatsApp' ? (user.whatsappNumber || '') : (user.telegramChatId || ''),
-          message: messageText,
-        });
-        queuedCount++;
-      }
-    }
-  }
-  return queuedCount;
+  return await runSweep(
+    'DueTodaySweep',
+    buildDueTodayPipeline(),
+    'DUE_TODAY'
+  );
 };
 
-/**
- * Sweep function to find overdue active loans and dispatch warnings.
- */
 export const runOverdueSweep = async () => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  const loans = await Loan.find({ status: 'active' }).populate('userId');
-  let queuedCount = 0;
-
-  for (const loan of loans) {
-    if (!loan.userId) continue;
-    const user = loan.userId;
-
-    const userPrefs = user.notificationSettings || {};
-    if (userPrefs.overdueAlerts === false) continue;
-
-    const dueDate = new Date(loan.nextDueDate);
-    dueDate.setHours(0, 0, 0, 0);
-
-    if (today > dueDate) { // Overdue
-      const diffTime = today.getTime() - dueDate.getTime();
-      const days = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-
-      if (days > 0) {
-        const geo = user.geo || 'IN';
-        const { symbol, locale } = getGeoFormatting(geo);
-
-        const messageText = replacePlaceholders(WhatsAppTemplates.MISSED_PAYMENT, {
-          loanName: `${loan.provider} ${loan.loanType}`,
-          emiAmount: loan.emiAmount.toLocaleString(locale),
-          days: days.toString()
-        });
-
-        const existing = await NotificationOutbox.findOne({
-          userId: user._id,
-          loanId: loan._id,
-          template: 'MISSED_PAYMENT',
-          status: 'pending'
-        });
-
-        if (!existing) {
-          await NotificationOutbox.create({
-            userId: user._id,
-            loanId: loan._id,
-            template: 'MISSED_PAYMENT',
-            chatId: user.notificationChannel === 'WhatsApp' ? (user.whatsappNumber || '') : (user.telegramChatId || ''),
-            message: messageText,
-          });
-          queuedCount++;
-        }
-      }
-    }
-  }
-  return queuedCount;
+  return await runSweep(
+    'OverdueSweep',
+    buildOverduePipeline(),
+    'OVERDUE'
+  );
 };
+
+export const runDueIn3DaysSweep = async () => {
+  return await runSweep(
+    'DueIn3DaysSweep',
+    buildDueIn3DaysPipeline(),
+    'DUE_IN_3_DAYS'
+  );
+};
+
 
 /**
  * Sweep function to generate and queue monthly loan summaries for all users.
@@ -343,6 +292,17 @@ export const initScheduler = () => {
     }
   });
 
+  // 1.5 Due In 3 Days sweep: daily at 9:15 AM
+  cron.schedule('15 9 * * *', async () => {
+    console.log('[Scheduler] Running daily 9:15 AM sweep (due in 3 days)...');
+    try {
+      const count = await runDueIn3DaysSweep();
+      console.log(`[Scheduler] Due In 3 Days sweep processed ${count} reminder(s).`);
+    } catch (error) {
+      console.error('[Scheduler] Due In 3 Days sweep error:', error.message);
+    }
+  });
+
   // 2. Due Today sweep: daily at 8:00 AM
   cron.schedule('0 8 * * *', async () => {
     console.log('[Scheduler] Running daily 8:00 AM sweep (due today)...');
@@ -387,18 +347,7 @@ export const initScheduler = () => {
     }
   });
 
-  // Outbox worker: runs every 5 minutes to dispatch queued alerts with retry support
-  cron.schedule('*/5 * * * *', async () => {
-    console.log('[Scheduler] Outbox worker sweeping pending queue...');
-    try {
-      const count = await dispatchOutboxQueue();
-      if (count > 0) {
-        console.log(`[Scheduler] Dispatched ${count} pending notification(s).`);
-      }
-    } catch (error) {
-      console.error('[Scheduler] Outbox worker sweep error:', error.message);
-    }
-  });
+
 
   // Monthly PDF Financial Report Dispatch — fires on the 1st of each month at 8:00 AM
   cron.schedule('0 8 1 * *', async () => {
@@ -424,92 +373,19 @@ export const initScheduler = () => {
   console.log('[Scheduler] Background cron scheduler registered successfully.');
 };
 
-import { sendWhatsAppMessage } from './whatsappService.js';
-
-/**
- * Sweeps the NotificationOutbox and attempts to send pending or failed entries (max 5 attempts).
- * 
- * @returns {Promise<number>} - Number of notifications successfully sent
- */
-export const dispatchOutboxQueue = async () => {
-  const pendingNotifications = await NotificationOutbox.find({
-    status: { $in: ['pending', 'failed'] },
-    attempts: { $lt: 5 },
-  }).populate('userId');
-
-  let sentCount = 0;
-
-  for (const notification of pendingNotifications) {
-    notification.attempts += 1;
-
-    const user = notification.userId;
-    let success = false;
-    let dispatchError = null;
-
-    if (user && user.notificationChannel === 'WhatsApp') {
-      const waNumber = user.whatsappNumber || notification.chatId;
-      try {
-        const cleanMsg = notification.message
-          .replace(/<br\s*\/?>/gi, '\n')
-          .replace(/<[^>]*>/g, ''); // Strip HTML tags for clean WhatsApp text formatting
-        const waResult = await sendWhatsAppMessage(waNumber, cleanMsg);
-        success = waResult.success;
-        if (!success) dispatchError = waResult.error;
-      } catch (err) {
-        dispatchError = err.message;
-      }
-    } else {
-      success = await sendTelegramMessage(notification.chatId, notification.message);
-      if (!success) {
-        dispatchError = 'Telegram Bot API request rejected or timeout.';
-      }
-    }
-
-    if (success) {
-      notification.status = 'sent';
-      notification.sentAt = new Date();
-      notification.lastError = null;
-      sentCount++;
-    } else {
-      notification.status = 'failed';
-      notification.lastError = dispatchError || 'Unknown dispatch error.';
-    }
-
-    await notification.save();
-
-    // Log the event to NotificationLog for tracking & analytics
-    await NotificationLog.create({
-      userId: user ? user._id : notification.userId,
-      phone: (user && user.notificationChannel === 'WhatsApp' ? user.whatsappNumber : user?.telegramChatId) || notification.chatId || '0000000000',
-      template: notification.template || 'OUTBOX_NOTIFICATION',
-      message: notification.message,
-      loanId: notification.loanId || null,
-      status: success ? 'delivered' : 'failed',
-      sentAt: notification.createdAt,
-      deliveredAt: success ? new Date() : null,
-      failedReason: success ? null : (dispatchError || 'Unknown dispatch error.'),
-    });
-  }
-
-  return sentCount;
-};
-
 /**
  * Helper to execute a manual sweep (queues notifications for anything due in the next 7 days for test purposes).
- * Triggers outbox dispatch immediately.
+ * Triggers outbox dispatch immediately via BullMQ (happens automatically after enqueue).
  * 
  * @returns {Promise<number>} - Number of notifications successfully processed
  */
 export const runManualSweep = async () => {
   console.log('[Manual Sweep] Running manual sweeps...');
   let totalQueued = 0;
+  totalQueued += await runDueIn3DaysSweep();
   totalQueued += await runDueTomorrowSweep();
   totalQueued += await runDueTodaySweep();
   totalQueued += await runOverdueSweep();
-
-  if (totalQueued > 0) {
-    await dispatchOutboxQueue();
-  }
 
   return totalQueued;
 };
@@ -700,3 +576,37 @@ export const runDataRetentionPurge = async () => {
   }
 };
 
+/**
+ * Initialize all automated cron schedules.
+ */
+export const startScheduler = () => {
+  console.log('[Scheduler] Initializing automated background cron jobs...');
+  
+  // Daily Sweeps at 9:00 AM
+  cron.schedule('0 9 * * *', async () => {
+    console.log('[Scheduler] Running 9:00 AM daily sweeps...');
+    await runDueTodaySweep();
+    await runDueTomorrowSweep();
+    await runDueIn3DaysSweep();
+  });
+
+  // Overdue Sweep at 9:30 AM
+  cron.schedule('30 9 * * *', async () => {
+    console.log('[Scheduler] Running 9:30 AM overdue sweep...');
+    await runOverdueSweep();
+  });
+
+  // Monthly Summaries at 10:00 AM on the 1st
+  cron.schedule('0 10 1 * *', async () => {
+    console.log('[Scheduler] Running monthly summary sweep...');
+    await runMonthlySummarySweep();
+  });
+
+  // Data Retention Purge at 2:00 AM daily
+  cron.schedule('0 2 * * *', async () => {
+    console.log('[Scheduler] Running daily data retention purge...');
+    await runDataRetentionPurge();
+  });
+
+  console.log('[Scheduler] Automated cron jobs initialized.');
+};

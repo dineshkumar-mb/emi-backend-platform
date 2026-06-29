@@ -33,6 +33,14 @@ class MockQueue {
     return job;
   }
 
+  async addBulk(jobs) {
+    const addedJobs = [];
+    for (const job of jobs) {
+      addedJobs.push(await this.add(job.name, job.data, job.opts));
+    }
+    return addedJobs;
+  }
+
   async getJobCount() {
     return this.jobs.length;
   }
@@ -115,9 +123,10 @@ export const getQueue = (name) => {
  * Register worker for a queue
  * @param {string} name 
  * @param {Function} processFn 
+ * @param {Object} opts - BullMQ worker options (e.g. concurrency, limiter)
  * @returns {Worker|null}
  */
-export const registerWorker = (name, processFn) => {
+export const registerWorker = (name, processFn, opts = {}) => {
   if (isRedisAvailable && redisClient) {
     if (WORKERS[name]) {
       console.warn(`[Queue Manager] Worker for queue "${name}" is already registered.`);
@@ -126,7 +135,7 @@ export const registerWorker = (name, processFn) => {
     const worker = new Worker(name, async (job) => {
       console.log(`[Worker ${name}] Processing job ${job.id}`);
       await processFn(job);
-    }, { connection: redisClient });
+    }, { connection: redisClient, ...opts });
     
     WORKERS[name] = worker;
     return worker;

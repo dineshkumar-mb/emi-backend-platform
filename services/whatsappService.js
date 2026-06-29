@@ -3,6 +3,7 @@ import User from '../models/User.js';
 import WhatsAppLog from '../models/WhatsAppLog.js';
 import { getWAClient } from './openwaClient.js';
 import { WhatsAppTemplates, replacePlaceholders } from '../templates/whatsappTemplates.js';
+import axios from 'axios';
 
 export const sendWhatsAppMessage = async (to, message, userId = null) => {
   const cleanNumber = to || '[Not Specified]';
@@ -22,8 +23,48 @@ export const sendWhatsAppMessage = async (to, message, userId = null) => {
   }
 
   try {
-    const client = getWAClient();
     const formattedNumber = cleanNumber.replace(/[^0-9]/g, '');
+
+    // 1. Try Meta Cloud API first if token exists
+    if (process.env.META_WA_ACCESS_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID) {
+      try {
+        const url = `https://graph.facebook.com/v17.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+        const payload = {
+          messaging_product: "whatsapp",
+          recipient_type: "individual",
+          to: formattedNumber,
+          type: "text",
+          text: { preview_url: false, body: message }
+        };
+        
+        const response = await axios.post(url, payload, {
+          headers: {
+            'Authorization': `Bearer ${process.env.META_WA_ACCESS_TOKEN}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        
+        console.log(`[WhatsApp Service] Message to ${formattedNumber} sent successfully via Meta Cloud API.`);
+        
+        await WhatsAppLog.create({
+          userId: resolvedUserId || new mongoose.Types.ObjectId(),
+          message,
+          status: 'SENT',
+        });
+        
+        return {
+          success: true,
+          messageId: response.data?.messages?.[0]?.id || 'wa_meta_' + Math.random().toString(36).substring(2, 11),
+          timestamp: new Date().toISOString()
+        };
+      } catch (metaErr) {
+        console.error(`[WhatsApp Service] Meta API transmission failed (falling back to OpenWA): ${metaErr.response?.data?.error?.message || metaErr.message}`);
+        // Fallthrough to OpenWA
+      }
+    }
+
+    // 2. Fallback to OpenWA
+    const client = getWAClient();
     
     // Send text via OpenWA
     const messageId = await client.sendText(`${formattedNumber}@c.us`, message);
@@ -34,14 +75,14 @@ export const sendWhatsAppMessage = async (to, message, userId = null) => {
       status: 'SENT',
     });
 
-    console.log(`[WhatsApp Service] Message to ${formattedNumber} sent successfully via OpenWA.`);
+    console.log(`[WhatsApp Service] Message to ${formattedNumber} sent successfully via OpenWA fallback.`);
     return {
       success: true,
       messageId: typeof messageId === 'string' ? messageId : 'wa_openwa_' + Math.random().toString(36).substring(2, 11),
       timestamp: new Date().toISOString()
     };
   } catch (err) {
-    console.error(`[WhatsApp Service] OpenWA transmission failed: ${err.message}`);
+    console.error(`[WhatsApp Service] Transmission completely failed: ${err.message}`);
     
     await WhatsAppLog.create({
       userId: resolvedUserId || new mongoose.Types.ObjectId(),
