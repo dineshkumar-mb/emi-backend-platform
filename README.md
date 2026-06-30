@@ -1,97 +1,66 @@
-# AI-Powered EMI Management & Loan Intelligence Platform - Backend
+# AI-Powered EMI Calculator - Backend
 
-This is the backend platform for the AI-Powered EMI Management & Loan Intelligence Platform, built using **Node.js**, **Express**, and **MongoDB**. It handles user authentication, loan data parsing, Gemini AI analysis, push notifications, and background job processing.
+A Node.js backend providing an intelligent loan management and EMI calculation engine with a RAG-enabled AI advisor.
 
-## 🚀 Key Features
+## 🚀 What Was Built
 
-- **AI Loan Intelligence**: Integration with Google Gemini (`@google/generative-ai`) for smart insights on EMI optimization and credit health.
-- **Job Queues**: Background queue processing powered by **BullMQ** and **Redis** (`ioredis`).
-- **Telemetry & Monitoring**: Integrated observability using **OpenTelemetry**, **Prometheus** (`prom-client`), and **Sentry**.
-- **Security & Validation**: Robust validation using **Zod**, secure password hashing via **Bcryptjs**, token-based authorization via **JWT**, and standard HTTP protections with **Helmet** and rate limiters.
-- **Integrations**: Multi-channel alerts using **Twilio** (SMS/WhatsApp), **Firebase** (FCM Push Notifications), and automated email alerts via **Nodemailer**.
-- **API Documentation**: Interactive API testing playground powered by **Swagger UI** (`swagger-ui-express`).
-- **Data Export**: PDF generation (`pdfkit`) and Excel spreadsheets (`exceljs`) for downloading loan summaries and debt repayment schedules.
+A Node.js/Express REST API that powers the EMI calculation platform. It manages user authentication, persists loan schedules in MongoDB, and orchestrates a Retrieval-Augmented Generation (RAG) pipeline to ground Google Gemini AI responses in user-uploaded documents (like PDF rate sheets or text files).
 
----
+## 💡 Why It's Technically Interesting
 
-## 🛠️ Tech Stack & Dependencies
+Instead of relying on a dedicated third-party vector database, the RAG pipeline is implemented entirely in-house using MongoDB and mathematical Dot Product (cosine similarity) in Node.js. It features a custom chunking algorithm with overlap and automatically switches to a sparse retrieval keyword-based fallback system (filtering stopwords) if the Gemini API key is missing or leaked.
 
-- **Runtime**: Node.js (ES Modules)
-- **Framework**: Express
-- **Database**: MongoDB (Mongoose ODM)
-- **State/Queue Store**: Redis
-- **Security**: Helmet, Express Rate Limit, JWT, BcryptJS
-- **Validation**: Zod
-- **AI**: Google Generative AI (Gemini)
+## 🛠️ Architecture
 
----
+- **Backend:** Node.js (v22), Express.
+- **Database:** MongoDB (using Mongoose) for persisting `LoanPayment` EMI schedules, `User` profiles, and `DocumentChunk` vectors.
+- **AI Integration:** Google Gemini (`@google/generative-ai`). `gemini-2.5-flash` is used to extract text from PDFs/images, and `text-embedding-004` generates the 768-dimensional embeddings.
+- **Background Jobs:** BullMQ for asynchronous document parsing and indexing.
 
-## 📁 Directory Structure
+## The AI Prompt & Data Structure
 
-```
-backend-platform/
-├── config/              # Configuration files (DB, Grafana, Prometheus)
-├── controllers/         # Request handling logic (Auth, Loan, Consent, Support, etc.)
-├── middleware/          # Security, Logging, and Rate-limiting middleware
-├── models/              # Mongoose DB Schemas (User, Loan, Transaction, AlertRule, etc.)
-├── services/            # Main application services (AI engine, EMI calculations, SMS, WhatsApp, Email)
-├── utils/               # Helper utilities (Encryption, Metrics, OpenTelemetry)
-├── server.js            # Entry point
-├── Dockerfile           # Docker container configuration
-└── swagger.json         # Swagger API documentation schema
-```
+The system uses specific system prompts to constrain the AI Advisor. It is fed a combined context of the user's current loans, assets, goals, subscriptions, and income/expenses. The RAG pipeline injects up to 6,000 characters of the most relevant document chunks into this context.
 
----
+**EMI Calculation Engine:**
+The core EMI math (`principal * rate / 12 / 100`) lives completely separate from the AI in `emiCalculationEngine.js`. This guarantees 100% deterministic mathematical accuracy for the loan schedules, ensuring the AI only acts as an advisor, not a calculator.
 
-## 💻 Getting Started
+## Response Validation & Fallback Logic
+
+- **RAG Fallback:** If a user queries the AI and no document chunk meets the similarity threshold (`0.70` for vectors, `0.25` for keywords), the system intercepts the query and explicitly sets the context to: *"No relevant document context was found. Answer using general financial knowledge and clearly state that uploaded documents did not contain relevant information."*
+- **Action Execution:** The AI is instructed to return structured action parameters (like `FILTER_LOANS` or `CREATE_REPAYMENT_PLAN`). The backend parses this JSON and executes actual database queries on behalf of the user.
+
+## Getting Started
 
 ### Prerequisites
+- Node.js v22
+- MongoDB connection string
+- Google Gemini API Key
 
-Ensure you have the following installed on your system:
-- **Node.js** (v18+ recommended)
-- **MongoDB** (Local or Atlas)
-- **Redis** (Required for BullMQ queue operations)
-
-### 1. Installation
-
-Clone the repository and install the dependencies:
+### Installation
 
 ```bash
-cd backend-platform
+git clone https://github.com/dineshkumar-mb/emi-backend-platform
+cd emi-backend-platform
 npm install
 ```
 
-### 2. Configuration
+### Running the Server
 
-Create a `.env` file in the root directory (based on `.env.example` if available) and add your environment variables:
-
-```env
-PORT=5000
-MONGO_URI=mongodb://localhost:27017/emi-tracker
-REDIS_HOST=localhost
-REDIS_PORT=6379
-JWT_SECRET=your_jwt_secret_here
-GEMINI_API_KEY=your_gemini_api_key_here
-# Firebase, Twilio, and SMTP configs as required
-```
-
-### 3. Run the Server
-
-**Development Mode (with auto-reload):**
 ```bash
+npm start
+# or for development:
 npm run dev
 ```
 
-**Production Mode:**
-```bash
-npm start
-```
+## Environment Variables
 
----
+Create a `.env` file with the following required keys:
+- `PORT`
+- `MONGO_URI`
+- `GEMINI_API_KEY`
+- `JWT_SECRET`
+- `RAG_MIN_SIMILARITY` (Optional, defaults to 0.70)
+- `RAG_KEYWORD_MIN_SIMILARITY` (Optional, defaults to 0.25)
 
-## 🔒 Security & Best Practices
-
-- All API request bodies are parsed and validated strictly using **Zod**.
-- Environment configurations are loaded from a `.env` file (which is git-ignored).
-- Rate limits are imposed on authentication and expensive endpoints.
-- Headers are secured using Helmet.
+## License
+MIT License
