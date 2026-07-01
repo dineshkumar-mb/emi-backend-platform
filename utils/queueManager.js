@@ -106,7 +106,7 @@ try {
  * @returns {Queue|MockQueue}
  */
 export const getQueue = (name) => {
-  if (isRedisAvailable && redisClient) {
+  if (redisClient) {
     if (!QUEUES[name]) {
       QUEUES[name] = new Queue(name, { connection: redisClient });
     }
@@ -127,15 +127,21 @@ export const getQueue = (name) => {
  * @returns {Worker|null}
  */
 export const registerWorker = (name, processFn, opts = {}) => {
-  if (isRedisAvailable && redisClient) {
+  if (redisClient) {
     if (WORKERS[name]) {
       console.warn(`[Queue Manager] Worker for queue "${name}" is already registered.`);
       return WORKERS[name];
     }
+    // BullMQ Workers must have their own dedicated connection
+    const workerConnection = new IORedis(redisUrl, {
+      maxRetriesPerRequest: null,
+      connectTimeout: 2000
+    });
+    
     const worker = new Worker(name, async (job) => {
       console.log(`[Worker ${name}] Processing job ${job.id}`);
       await processFn(job);
-    }, { connection: redisClient, ...opts });
+    }, { connection: workerConnection, ...opts });
     
     WORKERS[name] = worker;
     return worker;
@@ -155,7 +161,7 @@ export const getQueueDepth = async () => {
   const queueNames = ['notifications', 'emails', 'ai_tasks', 'reports'];
   
   for (const name of queueNames) {
-    if (isRedisAvailable && redisClient) {
+    if (redisClient) {
       try {
         const q = getQueue(name);
         const count = await q.getJobCountByTypes('waiting', 'active', 'delayed');

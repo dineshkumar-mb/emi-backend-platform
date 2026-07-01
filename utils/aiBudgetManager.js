@@ -1,6 +1,6 @@
 import User from '../models/User.js';
 
-const DAILY_QUERY_LIMIT = 30;
+const DAILY_QUERY_LIMIT = 100;
 const DAILY_TOKEN_LIMIT = 100000;
 
 /**

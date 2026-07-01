@@ -23,6 +23,7 @@ import NotificationLog from '../models/NotificationLog.js';
 import { WhatsAppTemplates, replacePlaceholders } from '../templates/whatsappTemplates.js';
 import { getQueue } from '../utils/queueManager.js';
 import { buildDueTomorrowPipeline, buildDueTodayPipeline, buildOverduePipeline, buildDueIn3DaysPipeline } from './aggregations/loanNotificationPipelines.js';
+import { queueNewsCrawl } from './newsScheduler.js';
 
 
 const getGeoFormatting = (geo) => {
@@ -606,6 +607,12 @@ export const startScheduler = () => {
   cron.schedule('0 2 * * *', async () => {
     console.log('[Scheduler] Running daily data retention purge...');
     await runDataRetentionPurge();
+  });
+
+  // Financial News Crawl every 6 hours
+  cron.schedule('0 */6 * * *', async () => {
+    console.log('[Scheduler] Running 6-hour financial news crawl...');
+    await queueNewsCrawl();
   });
 
   console.log('[Scheduler] Automated cron jobs initialized.');

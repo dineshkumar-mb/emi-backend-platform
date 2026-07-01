@@ -122,6 +122,7 @@ import {
   uploadDocument,
   getDocuments,
   deleteDocument,
+  deleteAllDocuments,
   clearNotificationCenterLogs,
 } from './controllers/intelligenceController.js';
 import {
@@ -151,6 +152,7 @@ import {
 } from './controllers/familyController.js';
 import { getForecastAnalytics, exportExcelReport } from './controllers/analyticsController.js';
 import { getHealthStatus } from './controllers/healthController.js';
+import newsRoutes from './routes/newsRoutes.js';
 
 import { sendTelegramMessage } from './services/telegramService.js';
 import { runManualSweep, dispatchMonthlyPdfReports } from './services/scheduler.js';
@@ -245,7 +247,7 @@ app.use(structuredLogger);
 // Multer Storage Configuration (In-Memory parsing for statements)
 const upload = multer({ 
   storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024 } // Limit files to 2MB
+  limits: { fileSize: 10 * 1024 * 1024 } // Limit files to 10MB
 });
 
 // ── Auth Routes ───────────────────────────────────────────────────────────────
@@ -735,6 +737,7 @@ intelligenceRouter.get('/notifications', getNotificationCenterLogs);
 intelligenceRouter.delete('/notifications', clearNotificationCenterLogs);
 intelligenceRouter.post('/documents', uploadLimiter, upload.single('file'), uploadSecurityMiddleware, uploadDocument);
 intelligenceRouter.get('/documents', getDocuments);
+intelligenceRouter.delete('/documents', deleteAllDocuments);
 intelligenceRouter.delete('/documents/:id', deleteDocument);
 // Manual monthly report trigger (per-user PDF email dispatch)
 intelligenceRouter.post('/report/send-monthly', async (req, res) => {
@@ -746,6 +749,8 @@ intelligenceRouter.post('/report/send-monthly', async (req, res) => {
   }
 });
 app.use('/api/intelligence', intelligenceRouter);
+
+app.use('/api/news', newsRoutes);
 
 // ── Analytics Router ─────────────────────────────────────────────────────────
 const analyticsRouter = express.Router();

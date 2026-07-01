@@ -12,13 +12,14 @@ import PushNotificationLog from '../models/PushNotificationLog.js';
 import DocumentParseLog from '../models/DocumentParseLog.js';
 import AlertRule from '../models/AlertRule.js';
 import Document from '../models/Document.js';
-import DocumentChunk from '../models/DocumentChunk.js';
 import { askAdvisorWithGemini, analyzeStatementWithGemini, getCreditPredictionAdviceWithGemini, getWealthAdviceWithGemini, getDynamicHealthScoreWithGemini } from '../services/geminiService.js';
 import { checkAndIncrementBudget } from '../utils/aiBudgetManager.js';
 import { generateFinancialReportPDF } from '../services/pdfService.js';
 import { calculateCreditScore, simulateCreditProjections, simulateScenario } from '../services/creditEngine.js';
 import { calculateSipFutureValue, analyzeEmergencyFund, analyzeAssetAllocation, projectWealthGrowth } from '../services/financialPlannerService.js';
-import { queueDocumentIndexing, retrieveRelevantChunks } from '../services/ragService.js';
+import { financialAdvisorAgent } from '../services/agents/financialAdvisorAgent.js';
+import { queueDocumentIndexing } from '../services/ragService.js';
+import { chromaService } from '../services/chromaClient.js';
 
 // @desc    Ask AI Advisor for customized advice
 // @route   POST /api/intelligence/advisor
@@ -34,42 +35,42 @@ export const askAdvisor = async (req, res) => {
     const goals = await Goal.find({ userId: req.user._id });
     const subscriptions = await Subscription.find({ userId: req.user._id });
     
-    // Retrieve relevant chunks if RAG is requested
-    let context = '';
-    let sources = [];
-    if (useRag) {
-      const { chunks, retrievalStatus } = await retrieveRelevantChunks(req.user._id, query);
-      if (retrievalStatus === 'matched' && chunks && chunks.length > 0) {
-        const MAX_CONTEXT_CHARS = 6000;
-        let currentChars = 0;
-        const selectedChunks = [];
-        for (const chunk of chunks) {
-          if (currentChars + chunk.content.length > MAX_CONTEXT_CHARS) {
-            break;
-          }
-          selectedChunks.push(chunk);
-          currentChars += chunk.content.length;
-        }
-        context = selectedChunks.map(c => `[Source Document: ${c.documentName}]\n${c.content}`).join('\n\n');
-        sources = selectedChunks.map(c => ({
-          documentName: c.documentName,
-          score: c.similarity
-        }));
-      } else {
-        context = 'No relevant document context was found. Answer using general financial knowledge and clearly state that uploaded documents did not contain relevant information.';
-      }
-    }
-
-    const advice = await askAdvisorWithGemini(
-      query,
+    // User context for the agent
+    const userContext = {
+      income: req.user.income || 0,
+      expenses: req.user.expenses || 0,
       loans,
       assets,
       goals,
-      subscriptions,
-      req.user.income || 0,
-      req.user.expenses || 0,
-      context
-    );
+      subscriptions
+    };
+
+    let advice;
+    let sources = [];
+
+    if (useRag) {
+      // Use the LangChain/ChromaDB Agent
+      const sessionId = req.user._id.toString();
+      const rawAdvice = await financialAdvisorAgent.generateAdvice(userContext, query, sessionId);
+      advice = {
+        response: rawAdvice.advice,
+        actions: (rawAdvice.recommendedActions || []).map(a => ({ type: 'RECOMMENDATION', parameters: { text: a } }))
+      };
+      // Mock sources as the agent formats them inline or we can adjust later
+      sources = []; 
+    } else {
+      // Use existing base advisor
+      advice = await askAdvisorWithGemini(
+        query,
+        loans,
+        assets,
+        goals,
+        subscriptions,
+        req.user.income || 0,
+        req.user.expenses || 0,
+        ''
+      );
+    }
 
     // Process actions if requested by the AI
     if (advice.actions && Array.isArray(advice.actions) && advice.actions.length > 0) {
@@ -1224,14 +1225,16 @@ export const uploadDocument = async (req, res) => {
       status: 'processing',
     });
 
-    // Start background queue-based processing
-    await queueDocumentIndexing(
+    // Start background processing without awaiting, so it doesn't block the response
+    queueDocumentIndexing(
       req.user._id,
       doc._id,
       req.file.originalname,
       req.file.buffer,
       req.file.mimetype
-    );
+    ).catch(err => {
+      console.error("[uploadDocument] Background indexing error:", err);
+    });
 
     res.status(201).json(doc);
   } catch (error) {
@@ -1261,11 +1264,40 @@ export const deleteDocument = async (req, res) => {
       return res.status(404).json({ message: 'Document not found.' });
     }
 
-    // Delete chunks and then the document record
-    await DocumentChunk.deleteMany({ documentId: doc._id });
+    // Delete the document record
     await Document.deleteOne({ _id: doc._id });
 
+    // Delete from ChromaDB
+    try {
+      const collection = await chromaService.getCollection('user_documents');
+      await collection.delete({ where: { docId: doc._id.toString() } });
+    } catch (chromaErr) {
+      console.error('[ChromaDB Delete] Error:', chromaErr);
+    }
+
     res.json({ message: 'Document and its indexed contents successfully deleted.' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Delete all documents for the user
+// @route   DELETE /api/intelligence/documents
+// @access  Private
+export const deleteAllDocuments = async (req, res) => {
+  try {
+    const userIdStr = req.user._id.toString();
+    await Document.deleteMany({ userId: req.user._id });
+
+    // Delete from ChromaDB
+    try {
+      const collection = await chromaService.getCollection('user_documents');
+      await collection.delete({ where: { userId: userIdStr } });
+    } catch (chromaErr) {
+      console.error('[ChromaDB Delete All] Error:', chromaErr);
+    }
+
+    res.json({ message: 'All documents successfully deleted.' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
