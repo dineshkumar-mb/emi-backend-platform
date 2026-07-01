@@ -241,7 +241,7 @@ export const runFinancialTipsSweep = async () => {
 
       const extraPayment = 500;
       const potentialMonthsSaved = Math.min(12, Math.round(highestInterestLoan.outstandingBalance / (highestInterestLoan.emiAmount * 10)));
-      
+
       const currentRate = highestInterestLoan.interestRate;
       let savingsText = '';
       if (currentRate > 10) {
@@ -530,21 +530,21 @@ export const dispatchMonthlyWhatsAppSummaries = async () => {
  */
 export const runDataRetentionPurge = async () => {
   console.log('[Data Retention] Running scheduled GDPR retention purges...');
-  
+
   try {
     // 1. Purge all users (and their data) who have revoked processing consent
     const revokedUsers = await User.find({ consentProcessing: false });
     for (const user of revokedUsers) {
       const userId = user._id;
       console.log(`[Data Retention] Purging user ${user.email} due to revoked processing consent.`);
-      
+
       await Loan.deleteMany({ userId });
       await Asset.deleteMany({ userId });
       await Goal.deleteMany({ userId });
       await Subscription.deleteMany({ userId });
       await Transaction.deleteMany({ userId });
       await FraudAlert.deleteMany({ userId });
-      
+
       await User.findByIdAndDelete(userId);
     }
 
@@ -557,7 +557,7 @@ export const runDataRetentionPurge = async () => {
 
     // 3. Purge logs older than 90 days
     const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
-    
+
     const smsPurged = await SmsLog.deleteMany({ createdAt: { $lt: ninetyDaysAgo } });
     const waPurged = await WhatsAppLog.deleteMany({ createdAt: { $lt: ninetyDaysAgo } });
     const emailPurged = await EmailLog.deleteMany({ createdAt: { $lt: ninetyDaysAgo } });
@@ -582,7 +582,7 @@ export const runDataRetentionPurge = async () => {
  */
 export const startScheduler = () => {
   console.log('[Scheduler] Initializing automated background cron jobs...');
-  
+
   // Daily Sweeps at 9:00 AM
   cron.schedule('0 9 * * *', async () => {
     console.log('[Scheduler] Running 9:00 AM daily sweeps...');
