@@ -59,8 +59,8 @@ This automatically builds the backend container and binds ports for Redis (6379)
 ### Manual Installation (Local Dev)
 
 ```bash
-git clone https://github.com/dineshkumar-mb/emi-backend-platform
-cd emi-backend-platform
+git clone https://github.com/dineshkumar-mb/emi-backend-platform backend-platform
+cd backend-platform
 npm install
 npm run dev
 ```
