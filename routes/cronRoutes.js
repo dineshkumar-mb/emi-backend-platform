@@ -5,7 +5,8 @@ import {
   runDueIn3DaysSweep, 
   runOverdueSweep,
   runMonthlySummarySweep,
-  runDataRetentionPurge
+  runDataRetentionPurge,
+  runAutoPaySweep
 } from '../services/scheduler.js';
 
 const router = express.Router();
@@ -33,6 +34,9 @@ router.get('/master-sweep', async (req, res) => {
     
     // Overdue sweep
     await runOverdueSweep();
+    
+    // AutoPay processing sweep
+    await runAutoPaySweep();
     
     // Data retention purge
     await runDataRetentionPurge();
