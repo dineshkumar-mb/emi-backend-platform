@@ -244,6 +244,17 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.use(structuredLogger);
 
+// Global Database Connection Middleware for Serverless Environment (Vercel)
+// Ensures the DB is connected before any route attempts to query it.
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (error) {
+    res.status(503).json({ message: 'Database connection failed. Please try again later.' });
+  }
+});
+
 // Multer Storage Configuration (In-Memory parsing for statements)
 const upload = multer({ 
   storage: multer.memoryStorage(),
