@@ -57,6 +57,16 @@ const loanSchema = new mongoose.Schema(
       type: Date,
       required: true,
     },
+    autoPayEnabled: {
+      type: Boolean,
+      default: false,
+    },
+    autoPayDay: {
+      type: Number,
+      min: 1,
+      max: 31,
+      default: null,
+    },
     status: {
       type: String,
       required: true,
@@ -68,7 +78,7 @@ const loanSchema = new mongoose.Schema(
         amount: { type: Number, required: true },
         date: { type: Date, default: Date.now },
         refId: { type: String, default: null },
-        source: { type: String, enum: ['SMS', 'GPay', 'Manual'], default: 'Manual' },
+        source: { type: String, enum: ['SMS', 'GPay', 'Manual', 'AutoPay'], default: 'Manual' },
       },
     ],
   },

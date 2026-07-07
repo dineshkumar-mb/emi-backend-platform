@@ -135,7 +135,16 @@ export const registerWorker = (name, processFn, opts = {}) => {
     // BullMQ Workers must have their own dedicated connection
     const workerConnection = new IORedis(redisUrl, {
       maxRetriesPerRequest: null,
-      connectTimeout: 2000
+      connectTimeout: 2000,
+      retryStrategy(times) {
+        if (times > 2) return null;
+        return 1000;
+      }
+    });
+
+    workerConnection.on('error', () => {
+      // Suppress unhandled error events to avoid crashing or console spam
+      // The main redisClient already logs Redis connection issues.
     });
     
     const worker = new Worker(name, async (job) => {

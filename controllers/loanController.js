@@ -15,7 +15,7 @@ import { calculateDebtCountdown } from '../services/debtCountdownService.js';
 // @route   POST /api/loans
 // @access  Private
 export const createLoan = async (req, res) => {
-  const { provider, loanType, principal, interestRate, tenure, emiAmount, nextDueDate } = req.body;
+  const { provider, loanType, principal, interestRate, tenure, emiAmount, nextDueDate, autoPayEnabled, autoPayDay } = req.body;
 
   try {
     // Determine EMI amount using the engine if not supplied by the user
@@ -31,6 +31,8 @@ export const createLoan = async (req, res) => {
       emiAmount: Number(calculatedEmi),
       outstandingBalance: Number(principal), // Start with total principal as outstanding
       nextDueDate: new Date(nextDueDate),
+      autoPayEnabled: Boolean(autoPayEnabled),
+      autoPayDay: autoPayDay ? Number(autoPayDay) : null,
       status: 'active',
       paymentHistory: [],
     });

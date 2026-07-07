@@ -155,6 +155,71 @@ export const runDueIn3DaysSweep = async () => {
   );
 };
 
+export const runAutoPaySweep = async () => {
+  console.log('[Scheduler] Starting AutoPay Sweep...');
+  const today = new Date();
+  const currentDay = today.getDate();
+  const currentMonth = today.getMonth();
+  const currentYear = today.getFullYear();
+  
+  const loans = await Loan.find({ 
+    status: 'active', 
+    autoPayEnabled: true, 
+    autoPayDay: currentDay 
+  });
+  
+  let processedCount = 0;
+  for (const loan of loans) {
+    try {
+      const startOfMonth = new Date(currentYear, currentMonth, 1);
+      const endOfMonth = new Date(currentYear, currentMonth + 1, 0, 23, 59, 59);
+      
+      const existingPayment = await LoanPayment.findOne({
+        loanId: loan._id,
+        source: 'AutoPay',
+        paymentDate: { $gte: startOfMonth, $lte: endOfMonth }
+      });
+      
+      if (existingPayment) continue;
+      
+      const interestPaid = (loan.outstandingBalance * loan.interestRate) / (12 * 100);
+      const principalPaid = loan.emiAmount - interestPaid;
+      
+      loan.outstandingBalance = Math.max(0, loan.outstandingBalance - principalPaid);
+      
+      const nextDate = new Date(loan.nextDueDate);
+      nextDate.setMonth(nextDate.getMonth() + 1);
+      loan.nextDueDate = nextDate;
+      
+      loan.paymentHistory.push({
+        amount: loan.emiAmount,
+        date: today,
+        source: 'AutoPay'
+      });
+      
+      await loan.save();
+      
+      await LoanPayment.create({
+        loanId: loan._id,
+        paymentDate: today,
+        emiNumber: 1,
+        emiAmount: loan.emiAmount,
+        principalPaid: principalPaid,
+        interestPaid: interestPaid,
+        outstandingBalance: loan.outstandingBalance,
+        paymentStatus: 'success',
+        source: 'AutoPay',
+      });
+      processedCount++;
+    } catch (err) {
+      console.error(`[AutoPay Sweep] Error for loan ${loan._id}:`, err.message);
+    }
+  }
+  console.log(`[Scheduler] AutoPay Sweep completed. Processed ${processedCount} payments.`);
+  return processedCount;
+};
+
+
 
 /**
  * Sweep function to generate and queue monthly loan summaries for all users.
@@ -586,6 +651,7 @@ export const startScheduler = () => {
   // Daily Sweeps at 9:00 AM
   cron.schedule('0 9 * * *', async () => {
     console.log('[Scheduler] Running 9:00 AM daily sweeps...');
+    await runAutoPaySweep();
     await runDueTodaySweep();
     await runDueTomorrowSweep();
     await runDueIn3DaysSweep();

@@ -90,8 +90,8 @@ export const extractLoanFromFile = async (buffer, mimeType) => {
 
   const currentDate = new Date().toISOString().split('T')[0];
 
-  const prompt = `
-You are a financial analysis assistant. Read the provided file, which can be an image (screenshot of SMS/alert), a PDF statement, a CSV spreadsheet, or a text document containing bank details or loan summaries. Extract the key loan terms.
+    const prompt = `
+You are a financial analysis assistant. Read the provided file, which can be an image (screenshot of SMS/alert), a PDF statement (including scanned image-based PDFs), a CSV spreadsheet, or a text document containing bank details or loan summaries. Perform OCR if necessary to extract the key loan terms from any images or scanned pages.
 
 Extract and map the parameters to the following JSON format:
 - "provider": The bank or finance institution name (e.g. "Chase", "HDFC Bank", "SBI"). Default to "Unknown Provider" if not found.
@@ -128,9 +128,14 @@ Output Schema:
     'text/html'
   ];
 
-  // If MIME type is not natively supported by Gemini, fallback to text/plain
+  // If MIME type is not natively supported by Gemini, fallback to text/plain, 
+  // or application/pdf if we can detect the PDF magic bytes.
   if (!supportedMimeTypes.includes(mimeType)) {
-    geminiMimeType = 'text/plain';
+    if (buffer.length > 4 && buffer.slice(0, 4).toString('utf8') === '%PDF') {
+      geminiMimeType = 'application/pdf';
+    } else {
+      geminiMimeType = 'text/plain';
+    }
   }
 
   // Convert buffer to generative AI part format
