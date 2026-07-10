@@ -42,6 +42,8 @@ import User from './models/User.js';
 import Loan from './models/Loan.js';
 import DocumentParseLog from './models/DocumentParseLog.js';
 import NotificationLog from './models/NotificationLog.js';
+import LoanPayment from './models/LoanPayment.js';
+import { calculateEmiBreakdown } from './services/emiCalculationEngine.js';
 
 // Route Imports
 import {
@@ -888,6 +890,34 @@ notificationRouter.post('/simulate-autopay/:loanId', async (req, res) => {
       messageText = replacePlaceholders(WhatsAppTemplates.AUTOPAY_SUCCESS, {
         loanName,
         emiAmount: loan.emiAmount.toLocaleString('en-IN')
+      });
+
+      // Process payment in database
+      const breakdown = calculateEmiBreakdown(loan.outstandingBalance, loan.interestRate, loan.emiAmount);
+      loan.outstandingBalance = breakdown.outstandingBalance;
+
+      const nextDate = new Date(loan.nextDueDate);
+      nextDate.setMonth(nextDate.getMonth() + 1);
+      loan.nextDueDate = nextDate;
+
+      loan.paymentHistory.push({
+        amount: loan.emiAmount,
+        date: new Date(),
+        source: 'AutoPay'
+      });
+
+      await loan.save();
+
+      await LoanPayment.create({
+        loanId: loan._id,
+        paymentDate: new Date(),
+        emiNumber: loan.paymentHistory.length,
+        emiAmount: loan.emiAmount,
+        principalPaid: breakdown.principalPaid,
+        interestPaid: breakdown.interestPaid,
+        outstandingBalance: loan.outstandingBalance,
+        paymentStatus: 'success',
+        source: 'AutoPay',
       });
     } else {
       templateName = 'AUTOPAY_FAILED';

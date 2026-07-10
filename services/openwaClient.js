@@ -47,6 +47,20 @@ export const setupDefaultSession = async () => {
         if (defaultSess) {
           sessionUuid = defaultSess.id;
           console.log(`[OpenWA Client] Resolved existing session UUID: ${sessionUuid}`);
+
+          if (defaultSess.status === 'failed' || defaultSess.status === 'error') {
+            console.log(`[OpenWA Client] Existing session is in "${defaultSess.status}" status. Stopping it first to allow clean restart...`);
+            try {
+              await fetch(`http://localhost:${API_PORT}/api/sessions/${sessionUuid}/stop`, {
+                method: 'POST',
+                headers: {
+                  'X-API-Key': API_KEY
+                }
+              });
+            } catch (stopErr) {
+              console.warn('[OpenWA Client] Failed to stop failed session:', stopErr.message);
+            }
+          }
         }
       }
     } else {

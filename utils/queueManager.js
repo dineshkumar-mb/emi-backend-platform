@@ -4,6 +4,7 @@ import IORedis from 'ioredis';
 const QUEUES = {};
 const WORKERS = {};
 const MOCK_QUEUES = {};
+const REGISTERED_HANDLERS = {};
 let redisClient = null;
 let isRedisAvailable = false;
 
@@ -80,6 +81,7 @@ try {
     retryStrategy(times) {
       if (times > 2) {
         console.warn('[Queue Manager] Redis is unavailable. Utilizing in-memory queue fallback.');
+        isRedisAvailable = false;
         return null; // Stop trying, trigger fallback
       }
       return 1000;
@@ -87,17 +89,54 @@ try {
   });
 
   redisClient.on('error', (err) => {
-    console.warn('[Queue Manager] Redis connection issue:', err.message);
+    if (isRedisAvailable) {
+      console.warn('[Queue Manager] Redis connection issue:', err.message);
+    }
     isRedisAvailable = false;
   });
 
   redisClient.on('connect', () => {
     console.log('[Queue Manager] Redis connected! Enabling BullMQ queues.');
     isRedisAvailable = true;
+    promoteMockWorkers();
+  });
+  
+  redisClient.on('end', () => {
+    console.warn('[Queue Manager] Redis connection closed permanently.');
+    isRedisAvailable = false;
   });
 } catch (e) {
   console.warn('[Queue Manager] Redis init failed. Using fallback:', e.message);
   isRedisAvailable = false;
+}
+
+function promoteMockWorkers() {
+  for (const [name, handler] of Object.entries(REGISTERED_HANDLERS)) {
+    if (!WORKERS[name]) {
+      console.log(`[Queue Manager] Promoting worker "${name}" to real Redis worker.`);
+      try {
+        const workerConnection = new IORedis(redisUrl, {
+          maxRetriesPerRequest: null,
+          connectTimeout: 2000,
+          retryStrategy(times) {
+            if (times > 2) return null;
+            return 1000;
+          }
+        });
+
+        workerConnection.on('error', () => {});
+
+        const worker = new Worker(name, async (job) => {
+          console.log(`[Worker ${name}] Processing job ${job.id}`);
+          await handler.processFn(job);
+        }, { connection: workerConnection, ...handler.opts });
+
+        WORKERS[name] = worker;
+      } catch (err) {
+        console.error(`[Queue Manager] Failed to promote worker "${name}":`, err.message);
+      }
+    }
+  }
 }
 
 /**
@@ -106,7 +145,7 @@ try {
  * @returns {Queue|MockQueue}
  */
 export const getQueue = (name) => {
-  if (redisClient) {
+  if (isRedisAvailable && redisClient) {
     if (!QUEUES[name]) {
       QUEUES[name] = new Queue(name, { connection: redisClient });
     }
@@ -127,12 +166,20 @@ export const getQueue = (name) => {
  * @returns {Worker|null}
  */
 export const registerWorker = (name, processFn, opts = {}) => {
-  if (redisClient) {
+  REGISTERED_HANDLERS[name] = { processFn, opts };
+
+  // Set process function on MockQueue so it can handle jobs immediately in mock mode
+  const mockQueue = getQueue(name);
+  if (mockQueue instanceof MockQueue) {
+    mockQueue.setProcessFn(processFn);
+  }
+
+  if (isRedisAvailable && redisClient) {
     if (WORKERS[name]) {
       console.warn(`[Queue Manager] Worker for queue "${name}" is already registered.`);
       return WORKERS[name];
     }
-    // BullMQ Workers must have their own dedicated connection
+    
     const workerConnection = new IORedis(redisUrl, {
       maxRetriesPerRequest: null,
       connectTimeout: 2000,
@@ -142,10 +189,7 @@ export const registerWorker = (name, processFn, opts = {}) => {
       }
     });
 
-    workerConnection.on('error', () => {
-      // Suppress unhandled error events to avoid crashing or console spam
-      // The main redisClient already logs Redis connection issues.
-    });
+    workerConnection.on('error', () => {});
     
     const worker = new Worker(name, async (job) => {
       console.log(`[Worker ${name}] Processing job ${job.id}`);
@@ -154,11 +198,9 @@ export const registerWorker = (name, processFn, opts = {}) => {
     
     WORKERS[name] = worker;
     return worker;
-  } else {
-    const mockQueue = getQueue(name);
-    mockQueue.setProcessFn(processFn);
-    return null;
   }
+  
+  return null;
 };
 
 /**
@@ -170,7 +212,7 @@ export const getQueueDepth = async () => {
   const queueNames = ['notifications', 'emails', 'ai_tasks', 'reports'];
   
   for (const name of queueNames) {
-    if (redisClient) {
+    if (isRedisAvailable && redisClient) {
       try {
         const q = getQueue(name);
         const count = await q.getJobCountByTypes('waiting', 'active', 'delayed');

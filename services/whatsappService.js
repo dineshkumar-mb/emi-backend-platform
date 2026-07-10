@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import User from '../models/User.js';
 import WhatsAppLog from '../models/WhatsAppLog.js';
-import { getWAClient } from './openwaClient.js';
+import { getWAClient, getSessionUuid } from './openwaClient.js';
 import { WhatsAppTemplates, replacePlaceholders } from '../templates/whatsappTemplates.js';
 import axios from 'axios';
 
@@ -25,7 +25,42 @@ export const sendWhatsAppMessage = async (to, message, userId = null) => {
   try {
     const formattedNumber = cleanNumber.replace(/[^0-9]/g, '');
 
-    // 1. Try Meta Cloud API first if token exists
+    // Check if local OpenWA session is connected and ready
+    let openWaReady = false;
+    const sessionUuid = getSessionUuid();
+    if (sessionUuid) {
+      try {
+        const response = await axios.get(`http://localhost:2785/api/sessions/${sessionUuid}`, {
+          headers: { 'X-API-Key': 'default_master_key_for_emi_tracker_999' }
+        });
+        if (response.data && response.data.status === 'ready') {
+          openWaReady = true;
+        }
+      } catch (err) {
+        // Local gateway offline or not initialized
+      }
+    }
+
+    if (openWaReady) {
+      console.log(`[WhatsApp Service] Local OpenWA session is active. Sending via OpenWA.`);
+      const client = getWAClient();
+      const messageId = await client.sendText(`${formattedNumber}@c.us`, message);
+
+      await WhatsAppLog.create({
+        userId: resolvedUserId || new mongoose.Types.ObjectId(),
+        message,
+        status: 'SENT',
+      });
+
+      console.log(`[WhatsApp Service] Message to ${formattedNumber} sent successfully via OpenWA.`);
+      return {
+        success: true,
+        messageId: typeof messageId === 'string' ? messageId : 'wa_openwa_' + Math.random().toString(36).substring(2, 11),
+        timestamp: new Date().toISOString()
+      };
+    }
+
+    // 1. Try Meta Cloud API next if token exists
     if (process.env.META_WA_ACCESS_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID) {
       try {
         const url = `https://graph.facebook.com/v17.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
@@ -50,7 +85,7 @@ export const sendWhatsAppMessage = async (to, message, userId = null) => {
           userId: resolvedUserId || new mongoose.Types.ObjectId(),
           message,
           status: 'SENT',
-        });
+      });
         
         return {
           success: true,
