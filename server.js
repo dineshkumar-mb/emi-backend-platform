@@ -648,7 +648,7 @@ loanRouter.post('/upload-statement', uploadLimiter, upload.single('file'), uploa
   try {
     const fileBuffer = req.file.buffer;
     const mimeType = req.file.mimetype;
-    const extractedData = await extractLoanFromFile(fileBuffer, mimeType);
+    const extractedData = await extractLoanFromFile(fileBuffer, mimeType, req.file.originalname || '');
 
     // Log successful parse
     await DocumentParseLog.create({

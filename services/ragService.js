@@ -1,56 +1,77 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import crypto from 'crypto';
 import { chromaService } from './chromaClient.js';
 import Document from '../models/Document.js';
-
-// Check if API key is invalid or reported as leaked
-const isInvalidOrLeakedKey = (key) => {
-  if (!key || key === 'PLACEHOLDER') return true;
-  const hash = crypto.createHash('sha256').update(key).digest('hex');
-  return hash === 'd81f6b86a712c52ac4f1ae959aebea377e196fa4947255f1098ae835404c57ec';
-};
+import { getGeminiApiKey, isInvalidOrLeakedKey } from './geminiService.js';
 
 /**
  * Generate embedding using Gemini's text-embedding-004
  */
 export const getEmbedding = async (text) => {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = getGeminiApiKey();
   if (isInvalidOrLeakedKey(apiKey)) {
     // Return mock 768-dimension vector when API key is leaked/missing
     return new Array(768).fill(0);
   }
 
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: 'text-embedding-004' });
-  const result = await model.embedContent(text);
-  if (!result || !result.embedding || !result.embedding.values) {
-    throw new Error('Failed to generate embedding from Gemini API.');
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: 'text-embedding-004' });
+    const result = await model.embedContent(text);
+    if (!result || !result.embedding || !result.embedding.values) {
+      return new Array(768).fill(0);
+    }
+    return result.embedding.values;
+  } catch (err) {
+    console.warn('[RAG] getEmbedding failed, returning fallback vector:', err.message);
+    return new Array(768).fill(0);
   }
-  return result.embedding.values;
 };
 
 /**
  * Extract content from PDFs, CSVs, or images using gemini-2.5-flash
+ * with fallback to local PDF and text parsing
  */
 export const extractTextWithGemini = async (buffer, mimeType) => {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = getGeminiApiKey();
   if (isInvalidOrLeakedKey(apiKey)) {
-    throw new Error('PDF, CSV, or Image document indexing requires a valid GEMINI_API_KEY.');
-  }
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-  
-  const prompt = `Extract all readable text and structural content from this document cleanly.`;
-  
-  const filePart = {
-    inlineData: {
-      data: buffer.toString('base64'),
-      mimeType: mimeType
+    if (mimeType === 'application/pdf' || (buffer.length > 4 && buffer.slice(0, 4).toString('utf8') === '%PDF')) {
+      try {
+        const { PDFParse } = await import('pdf-parse');
+        const parser = new PDFParse({ data: buffer });
+        return await parser.getText();
+      } catch (err) {
+        return buffer.toString('utf8');
+      }
     }
-  };
+    return buffer.toString('utf8');
+  }
 
-  const result = await model.generateContent([prompt, filePart]);
-  return result.response.text().trim();
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    
+    const prompt = `Extract all readable text and structural content from this document cleanly.`;
+    
+    const filePart = {
+      inlineData: {
+        data: buffer.toString('base64'),
+        mimeType: mimeType
+      }
+    };
+
+    const result = await model.generateContent([prompt, filePart]);
+    return result.response.text().trim();
+  } catch (error) {
+    console.warn('[RAG] extractTextWithGemini error, using fallback extractor:', error.message);
+    if (mimeType === 'application/pdf' || (buffer.length > 4 && buffer.slice(0, 4).toString('utf8') === '%PDF')) {
+      try {
+        const { PDFParse } = await import('pdf-parse');
+        const parser = new PDFParse({ data: buffer });
+        return await parser.getText();
+      } catch (_) {}
+    }
+    return buffer.toString('utf8');
+  }
 };
 
 /**
